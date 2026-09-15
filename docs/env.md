@@ -529,6 +529,9 @@ without redeploying the frontend (the flag is pulled from
 | `AI_BASE_URL` | None | Default URL to access AI API endpoint (Albert API) | Optional |
 | `AI_API_KEY` | None| API Key used for AI features | Optional |
 | `AI_MODEL` | None | Default model used for AI features | Optional |
+| `AI_RAG_COLLECTION_IDS` | `150281,150277,139226` | Comma-separated Albert collection IDs used to ground AI reply drafts. The defaults are the public Service-Public, Travail/Emploi and Légifrance collections. | Optional |
+| `AI_RAG_SEARCH_LIMIT` | `5` | Maximum number of Albert excerpts included in an AI reply draft. | Optional |
+| `AI_DRAFT_PREVIEW_ONLY` | `False` | When `True`, generate a local preview instead of calling Albert. | Optional |
 | `FEATURE_AI_SUMMARY` | `False` | Default enabled mode for summary AI features | Required |
 | `FEATURE_AI_AUTOLABELS` | `False` | Default enabled mode for label AI features | Required |
 

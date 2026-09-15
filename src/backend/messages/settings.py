@@ -1352,6 +1352,16 @@ class Base(Configuration):
     AI_API_KEY = values.Value(None, environ_name="AI_API_KEY", environ_prefix=None)
     AI_BASE_URL = values.Value(None, environ_name="AI_BASE_URL", environ_prefix=None)
     AI_MODEL = values.Value(None, environ_name="AI_MODEL", environ_prefix=None)
+    # Albert public collections to use when grounding AI reply drafts. Values are
+    # integer IDs, supplied as a comma-separated environment variable.
+    AI_RAG_COLLECTION_IDS = values.ListValue(
+        ["150281", "150277", "139226"],
+        environ_name="AI_RAG_COLLECTION_IDS",
+        environ_prefix=None,
+    )
+    AI_RAG_SEARCH_LIMIT = values.PositiveIntegerValue(
+        5, environ_name="AI_RAG_SEARCH_LIMIT", environ_prefix=None
+    )
     AI_DRAFT_PREVIEW_ONLY = values.BooleanValue(
         default=False, environ_name="AI_DRAFT_PREVIEW_ONLY", environ_prefix=None
     )
