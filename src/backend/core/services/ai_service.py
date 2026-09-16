@@ -73,8 +73,57 @@ class AIService:
                 f"Albert API {response.status_code} on {response.url}: {response.text[:500]}"
             ) from exc
 
-    def search_chunks(self, question: str) -> list[dict]:
+    @staticmethod
+    def _collection_ids(collection_ids: list | None = None) -> list:
+        """Return the collection ids to search, without mutating settings.
+
+        Ids are passed through with their original type (int or str): Albert
+        rejects the wrong type, and env parsing may produce either.
+
+        ``settings.AI_COLLECTION_IDS`` is a shared list: appending the private
+        collection to it directly made it grow on every single request.
+        """
+        if collection_ids is not None:
+            return [cid for cid in collection_ids if cid]
+        ids = list(settings.AI_COLLECTION_IDS or [])
+        if settings.AI_PRIVATE_COLLECTION_ID:
+            ids.append(settings.AI_PRIVATE_COLLECTION_ID)
+        return [cid for cid in ids if cid]
+
+    @staticmethod
+    def _normalize_search_result(result: dict) -> dict | None:
+        """Flatten one Albert search hit into a chunk dict carrying provenance.
+
+        Keeping the collection/document/chunk ids (and not only the text) is
+        what makes a generated draft auditable afterwards.
+        """
+        chunk = result.get("chunk") or {}
+        content = (chunk.get("content") or "").strip()
+        if not content:
+            return None
+        metadata = chunk.get("metadata") or {}
+        return {
+            "content": content,
+            "chunk_id": chunk.get("id"),
+            "document_id": chunk.get("document_id") or metadata.get("document_id"),
+            "collection_id": chunk.get("collection_id")
+            or metadata.get("collection_id"),
+            "document_name": metadata.get("document_name") or metadata.get("name"),
+            "search_score": result.get("score"),
+            "search_method": result.get("method"),
+            "rerank_score": None,
+        }
+
+    def search_chunks(
+        self,
+        question: str,
+        limit: int | None = None,
+        collection_ids: list | None = None,
+    ) -> list[dict]:
         """Search relevant chunks in the Albert API vector store.
+
+        Returns a list of normalized chunk dicts (text + provenance + score),
+        ordered as returned by Albert.
 
         The query must be a non-empty, non-whitespace string, otherwise the API
         answers 422 Unprocessable Entity.
@@ -83,19 +132,16 @@ class AIService:
         if not question:
             # Ne jamais appeler l'API avec une requête vide : c'est un 422 garanti.
             return []
-        logger.debug(f"{settings}")
+
         payload = {
-            "query": question[:settings.AI_QUERY_MAX_CHARS],
-            "method": settings.AI_SEARCH_METHOD,
-            "limit": settings.AI_SEARCH_LIMIT,
+            "query": question[: settings.AI_QUERY_MAX_CHARS],
+            "method": settings.AI_SEARCH_METHOD or "semantic",
+            "limit": limit or settings.AI_SEARCH_LIMIT,
         }
-        if settings.AI_COLLECTION_IDS:
-            logger.critical(f"settings.AI_COLLECTION_IDS: {settings.AI_COLLECTION_IDS}, {type(settings.AI_COLLECTION_IDS)}")
-            collections_ids = settings.AI_COLLECTION_IDS
-            if settings.AI_PRIVATE_COLLECTION_ID:
-                collections_ids.append(settings.AI_PRIVATE_COLLECTION_ID)
-            logger.critical(f'COLLECTIONS IDS USED: {collections_ids}')
-            payload["collection_ids"] = collections_ids
+        ids = self._collection_ids(collection_ids)
+        if ids:
+            payload["collection_ids"] = ids
+        logger.debug("Albert search: limit=%s collections=%s", payload["limit"], ids)
 
         response = requests.post(
             url=f"{settings.AI_BASE_URL}/search",
@@ -105,16 +151,64 @@ class AIService:
         )
         self.__check_response(response)
         # Réponse : {"object": "list", "data": [{"method", "score", "chunk": {...}}, ...]}
-        return response.json()["data"]
+        results = response.json().get("data") or []
+        chunks = [self._normalize_search_result(result) for result in results]
+        return [chunk for chunk in chunks if chunk]
 
-    def call_ai_api(self, prompt):
-        """Helper method to call the OpenAI API and process the response."""
+    def rerank(self, query: str, documents: list[str], top_n: int) -> list[dict]:
+        """Reorder ``documents`` by relevance to ``query`` via POST /v1/rerank.
+
+        Albert follows the Cohere v2 rerank convention and answers
+        ``{"results": [{"index": int, "relevance_score": float}, ...]}``.
+        The returned list keeps that shape, filtered to valid indexes.
+        """
+        query = (query or "").strip()
+        if not query or not documents:
+            return []
+
+        response = requests.post(
+            url=f"{settings.AI_BASE_URL}/rerank",
+            headers=self.headers,
+            json={
+                "model": settings.AI_RAG_RERANK_MODEL,
+                "query": query[: settings.AI_QUERY_MAX_CHARS],
+                "documents": documents,
+                "top_n": min(top_n, len(documents)),
+            },
+            timeout=60,
+        )
+        self.__check_response(response)
+        payload = response.json()
+        results = payload.get("results")
+        if results is None:
+            # Certaines passerelles renvoient la liste sous "data".
+            results = payload.get("data") or []
+        return [
+            result
+            for result in results
+            if isinstance(result.get("index"), int)
+            and 0 <= result["index"] < len(documents)
+        ]
+
+    def call_ai_api(self, prompt, system_prompt: str | None = None, temperature=None):
+        """Helper method to call the OpenAI API and process the response.
+
+        ``system_prompt`` and ``temperature`` are optional so existing callers
+        (summarizer, classifier) keep working unchanged.
+        """
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
         data = {
             "model": settings.AI_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
 #            "stream": False,
 #            "n": 1,
         }
+        if temperature is not None:
+            data["temperature"] = temperature
 
         try:
             response = self.client.chat.completions.create(**data)

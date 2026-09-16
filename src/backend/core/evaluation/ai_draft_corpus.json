@@ -1,0 +1,44 @@
+[
+  {
+    "id": "cni-delai",
+    "question": "Bonjour, j'ai déposé une demande de renouvellement de carte nationale d'identité le mois dernier. Quel est le délai de traitement habituel ? Cordialement.",
+    "expected_keywords": ["carte nationale d'identité", "délai"],
+    "expected_document_ids": [],
+    "expect_human_review": false
+  },
+  {
+    "id": "justificatif-domicile",
+    "question": "Madame, Monsieur, quels justificatifs de domicile sont acceptés pour une demande de passeport ?",
+    "expected_keywords": ["justificatif de domicile", "passeport"],
+    "expected_document_ids": [],
+    "expect_human_review": false
+  },
+  {
+    "id": "rupture-conventionnelle",
+    "question": "Bonjour, mon employeur me propose une rupture conventionnelle. Ai-je droit à l'allocation chômage ensuite ?",
+    "expected_keywords": ["rupture conventionnelle", "allocation"],
+    "expected_document_ids": [],
+    "expect_human_review": false
+  },
+  {
+    "id": "dossier-individuel-hors-perimetre",
+    "question": "Bonjour, où en est mon dossier numéro 2024-XR-8891 ? Je n'ai pas eu de nouvelles depuis six semaines.",
+    "expected_keywords": [],
+    "expected_document_ids": [],
+    "expect_human_review": true
+  },
+  {
+    "id": "question-hors-sujet",
+    "question": "Bonjour, pouvez-vous me recommander un bon restaurant près de la mairie ?",
+    "expected_keywords": [],
+    "expected_document_ids": [],
+    "expect_human_review": true
+  },
+  {
+    "id": "demande-multi-parties",
+    "question": "Bonjour, je souhaite connaître les pièces à fournir pour un renouvellement de titre de séjour, et savoir si mon rendez-vous du 12 mars peut être décalé.",
+    "expected_keywords": ["titre de séjour"],
+    "expected_document_ids": [],
+    "expect_human_review": false
+  }
+]

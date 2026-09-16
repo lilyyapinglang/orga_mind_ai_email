@@ -1360,7 +1360,9 @@ class Base(Configuration):
         1000, environ_name="AI_QUERY_MAX_CHARS", environ_prefix=None
     )
     #string
-    AI_SEARCH_METHOD = values.Value(None, environ_name="AI_SEARCH_METHOD", environ_prefix=None)
+    AI_SEARCH_METHOD = values.Value(
+        "semantic", environ_name="AI_SEARCH_METHOD", environ_prefix=None
+    )
     #int
     AI_SEARCH_LIMIT = values.PositiveIntegerValue(
         10, environ_name="AI_SEARCH_LIMIT", environ_prefix=None
@@ -1371,6 +1373,42 @@ class Base(Configuration):
     )
     AI_PRIVATE_COLLECTION_ID = values.Value(
         None, environ_name="AI_PRIVATE_COLLECTION_ID", environ_prefix=None
+    )
+
+    # AI - RAG retrieval pipeline (search -> rerank -> evidence gate)
+    # Number of candidate chunks requested from Albert POST /v1/search before
+    # reranking. Albert recommends 20-50 candidates for a reranked pipeline.
+    AI_RAG_SEARCH_CANDIDATES = values.PositiveIntegerValue(
+        25, environ_name="AI_RAG_SEARCH_CANDIDATES", environ_prefix=None
+    )
+    # Number of excerpts actually sent to the generation model (Albert
+    # recommends top_n between 3 and 10).
+    AI_RAG_CONTEXT_LIMIT = values.PositiveIntegerValue(
+        5, environ_name="AI_RAG_CONTEXT_LIMIT", environ_prefix=None
+    )
+    # Reranking model id. Empty disables reranking and falls back to the raw
+    # search ordering (useful to A/B the pipeline on your own corpus).
+    AI_RAG_RERANK_MODEL = values.Value(
+        "openweight-rerank", environ_name="AI_RAG_RERANK_MODEL", environ_prefix=None
+    )
+    # Minimum reranker relevance_score for an excerpt to be considered usable
+    # evidence. Only applied to reranker scores, never to raw search scores.
+    # Defaults to 0.0 (accept everything the reranker returns) ON PURPOSE: the
+    # score range of a reranking model is corpus- and model-dependent, so a
+    # guessed threshold silently turns every reply into a holding message.
+    # Measure your own scores with `manage.py ai_rag_debug` first, then raise it.
+    AI_RAG_MIN_RELEVANCE_SCORE = values.FloatValue(
+        0.0, environ_name="AI_RAG_MIN_RELEVANCE_SCORE", environ_prefix=None
+    )
+    # When True, a reply with no usable evidence becomes a safe "human review"
+    # draft instead of a factual answer generated from the model's own memory.
+    AI_RAG_REQUIRE_EVIDENCE = values.BooleanValue(
+        default=True, environ_name="AI_RAG_REQUIRE_EVIDENCE", environ_prefix=None
+    )
+    # Bumped whenever the generation contract changes; stored with each draft
+    # so quality investigations can tell which prompt produced which answer.
+    AI_PROMPT_VERSION = values.Value(
+        "ai-draft-2026-09-rag-v2", environ_name="AI_PROMPT_VERSION", environ_prefix=None
     )
 
 

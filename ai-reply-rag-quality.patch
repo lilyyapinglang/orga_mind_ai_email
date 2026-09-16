@@ -1,0 +1,1383 @@
+diff --git a/src/backend/core/api/viewsets/ai_draft.py b/src/backend/core/api/viewsets/ai_draft.py
+index 444441c2..6092fec6 100644
+--- a/src/backend/core/api/viewsets/ai_draft.py
++++ b/src/backend/core/api/viewsets/ai_draft.py
+@@ -1,15 +1,16 @@
+ """API view for generating an AI reply and saving it as a draft."""
+ 
++import dataclasses
+ import json
+ import logging
+ import os
++import re
+ 
+ from django.conf import settings
+ from django.core.exceptions import ImproperlyConfigured
+ from django.db.models import Exists, OuterRef
+ 
+ import rest_framework as drf
+-import requests
+ from drf_spectacular.utils import OpenApiExample, extend_schema, inline_serializer
+ from rest_framework import serializers as drf_serializers
+ from rest_framework import status
+@@ -18,6 +19,7 @@ from rest_framework.views import APIView
+ 
+ from core import enums, models
+ from core.mda.draft import create_draft
++from core.services import ai_rag
+ from core.services.ai_service import AIService
+ 
+ from .. import permissions, serializers
+@@ -28,11 +30,15 @@ THREAD_CONTEXT_MAX_MESSAGES = 8
+ THREAD_CONTEXT_MAX_CHARS_PER_MESSAGE = 2000
+ 
+ 
+-def build_rag_context(question: str, results: list[dict]) -> str:
+-    """Build the RAG context block from the retrieved chunks."""
++def build_rag_context(question: str, chunks: list[dict]) -> str:
++    """Build the RAG context block from the retained excerpts.
++
++    Excerpts are numbered so the model can reference them in ``source_indexes``
++    and so an agent can map a sentence back to an official source.
++    """
+     extraits = "\n\n".join(
+-        f"[Extrait {i}]\n{result['chunk']['content']}"
+-        for i, result in enumerate(results, start=1)
++        f"[Extrait {i}]\n{chunk['content']}"
++        for i, chunk in enumerate(chunks, start=1)
+     )
+     return (
+         "Réponds uniquement en t'appuyant sur les extraits fournis.\n"
+@@ -185,44 +191,216 @@ def generate_ai_reply_body(
+         raise
+ 
+ 
++GROUNDING_CONTRACT = (
++    "Grounding rules (these override every other instruction):\n"
++    "- Every factual statement in the reply must be supported by one of the "
++    "numbered excerpts. A fact with no supporting excerpt must not be written.\n"
++    "- Never combine two unrelated excerpts to build a new rule, threshold or "
++    "procedure that neither excerpt states on its own.\n"
++    "- Never infer eligibility, deadlines, amounts, fees, processing times or "
++    "legal consequences. State only what an excerpt says explicitly.\n"
++    "- Facts about this citizen's own case (dates, amounts, names, reference "
++    "numbers) come from the email thread, not from the excerpts.\n"
++    "- Do not cite excerpt numbers, URLs or document names in the reply body: "
++    "the agent reviews sources separately.\n"
++    "- List in 'unanswered_points' every part of the citizen's request that the "
++    "excerpts do not cover, and set 'needs_human_review' to true whenever such "
++    "a part exists or you are unsure.\n"
++)
++
++STRUCTURED_OUTPUT_CONTRACT = (
++    "Return ONLY a JSON object, with no Markdown fence and no text around it, "
++    "with exactly these keys:\n"
++    '{"body": "the reply body as plain text, \\n for line breaks", '
++    '"needs_human_review": true or false, '
++    '"unanswered_points": ["short description of each uncovered point"], '
++    '"source_indexes": [numbers of the excerpts actually used]}\n'
++)
++
++# Safe reply used whenever there is no usable evidence. It commits the
++# administration to nothing and invents nothing.
++SAFE_DRAFT_BODY = (
++    "Madame, Monsieur,\n\n"
++    "Nous accusons réception de votre message.\n\n"
++    "Votre demande nécessite une vérification par notre service. Nous revenons "
++    "vers vous dès que possible.\n\n"
++    "Je vous prie d'agréer, Madame, Monsieur, l'expression de mes salutations "
++    "distinguées.\n\n"
++    "[Signature]"
++)
++
++
++@dataclasses.dataclass
++class GeneratedReply:
++    """A generated draft body plus everything an agent needs to review it."""
++
++    body: str
++    needs_human_review: bool = False
++    unanswered_points: list = dataclasses.field(default_factory=list)
++    source_indexes: list = dataclasses.field(default_factory=list)
++    evidence_status: str = ai_rag.EvidenceStatus.NO_RESULTS.value
++    sources: list = dataclasses.field(default_factory=list)
++    grounded: bool = False
++
++    def metadata(self) -> dict:
++        """Reviewable metadata returned alongside the created draft."""
++        used = set(self.source_indexes)
++        return {
++            "needsHumanReview": self.needs_human_review,
++            "unansweredPoints": self.unanswered_points,
++            "evidenceStatus": self.evidence_status,
++            "grounded": self.grounded,
++            "model": settings.AI_MODEL,
++            "promptVersion": settings.AI_PROMPT_VERSION,
++            "rerankModel": settings.AI_RAG_RERANK_MODEL or None,
++            "sources": [
++                {**source, "used": source["index"] in used} for source in self.sources
++            ],
++        }
++
++
++def _parse_structured_reply(raw: str) -> dict | None:
++    """Parse the model's JSON answer, tolerating fences and surrounding prose."""
++    text = (raw or "").strip()
++    if text.startswith("```"):
++        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
++        text = re.sub(r"\n?```$", "", text).strip()
++
++    candidates = [text]
++    match = re.search(r"\{.*\}", text, re.DOTALL)
++    if match:
++        candidates.append(match.group(0))
++
++    for candidate in candidates:
++        try:
++            parsed = json.loads(candidate)
++        except (json.JSONDecodeError, TypeError):
++            continue
++        if isinstance(parsed, dict) and isinstance(parsed.get("body"), str):
++            return parsed
++    return None
++
++
++def _validate_structured_reply(parsed: dict, excerpt_count: int) -> GeneratedReply:
++    """Coerce the parsed payload into a trustworthy GeneratedReply."""
++    body = parsed["body"].strip()
++
++    unanswered = parsed.get("unanswered_points") or []
++    if not isinstance(unanswered, list):
++        unanswered = [str(unanswered)]
++    unanswered = [str(point).strip() for point in unanswered if str(point).strip()]
++
++    raw_indexes = parsed.get("source_indexes") or []
++    if not isinstance(raw_indexes, list):
++        raw_indexes = [raw_indexes]
++    indexes = sorted(
++        {
++            int(index)
++            for index in raw_indexes
++            if isinstance(index, (int, float, str))
++            and str(index).strip().lstrip("-").isdigit()
++            and 1 <= int(index) <= excerpt_count
++        }
++    )
++
++    needs_review = bool(parsed.get("needs_human_review")) or bool(unanswered)
++    # A grounded answer that cites no excerpt at all is, by our own contract,
++    # unsupported: flag it rather than presenting it as verified.
++    if excerpt_count and not indexes:
++        needs_review = True
++
++    return GeneratedReply(
++        body=body,
++        needs_human_review=needs_review,
++        unanswered_points=unanswered,
++        source_indexes=indexes,
++    )
++
++
++def _build_grounded_prompt(
++        message: models.Message,
++        current_draft_text: str | None,
++        context_block: str,
++) -> str:
++    """Add the excerpts, the grounding rules and the output contract."""
++    prompt = _build_prompt(message, current_draft_text)
++    return prompt.replace(
++        "Draft reply:\n\n",
++        f"Official reference excerpts to rely on:\n\n{context_block}\n\n"
++        f"{GROUNDING_CONTRACT}\n"
++        "Conflict rule:\n"
++        "When the agent draft conflicts with these official excerpts, "
++        "ignore the draft and answer according to the excerpts. Do not "
++        "mention the conflict to the citizen unless clarification is "
++        "needed.\n\n"
++        f"{STRUCTURED_OUTPUT_CONTRACT}\n"
++        "Draft reply:\n\n",
++    )
++
++
+ def generate_ai_reply_body_with_rag(
+         message: models.Message, current_draft_text: str | None = None
+-) -> str:
+-    """Generate the reply body enriched with RAG chunks from Albert API."""
++) -> GeneratedReply:
++    """Generate a reply grounded in reranked Albert excerpts.
++
++    Pipeline: build the query from the thread, retrieve a broad candidate set,
++    rerank it, drop weak evidence, then either generate under a grounding
++    contract or return a safe "needs verification" draft.
++    """
+     query = _rag_search_query(message, current_draft_text)
+-    context_block = None
++    evidence = ai_rag.retrieve_evidence(query)
++
++    if not evidence.has_evidence:
++        if settings.AI_RAG_REQUIRE_EVIDENCE:
++            # No supporting excerpt: never state administrative facts from the
++            # model's own memory. Hand the thread back to the agent instead.
++            logger.info(
++                "No usable evidence (%s) for message %s; returning safe draft.",
++                evidence.status.value,
++                message.id,
++            )
++            return GeneratedReply(
++                body=SAFE_DRAFT_BODY,
++                needs_human_review=True,
++                unanswered_points=[
++                    "Aucune source officielle pertinente n'a été trouvée pour "
++                    "cette demande : réponse à rédiger ou à vérifier par un agent."
++                ],
++                evidence_status=evidence.status.value,
++                grounded=False,
++            )
++        # Evidence not required (explicitly configured): ungrounded reply,
++        # still flagged for review.
++        body = AIService().call_ai_api(_build_prompt(message, current_draft_text))
++        return GeneratedReply(
++            body=body.strip(),
++            needs_human_review=True,
++            evidence_status=evidence.status.value,
++            grounded=False,
++        )
+ 
+-    if query:
+-        try:
+-            results = AIService().search_chunks(query)
+-            logger.info("Albert RAG: %d chunks retrieved for query: %s", len(results), query[:200])
+-            if results:
+-                context_block = build_rag_context(query, results)
+-        except ImproperlyConfigured:
+-            # Pas de clé Albert configurée : réponse IA sans contexte RAG.
+-            logger.warning("Albert API key not configured; skipping RAG context.")
+-        except requests.RequestException:
+-            # Albert indisponible ou requête rejetée : dégradation propre.
+-            logger.exception("Albert RAG search failed; falling back without context.")
+-
+-    if context_block:
+-        # Le bloc RAG est passé comme "draft/intent" complémentaire du prompt :
+-        # le service IA conserve les consignes de ton et de non-invention.
+-        prompt = _build_prompt(message, current_draft_text)
+-        prompt = prompt.replace(
+-            "Draft reply:\n\n",
+-            f"Official reference excerpts to rely on:\n\n{context_block}\n\nDraft reply:\n\n"
+-            "Conflict rule:\n"
+-            "When the agent draft conflicts with these official excerpts, "
+-            "ignore the draft and answer according to the excerpts. Do not "
+-            "mention the conflict to the citizen unless clarification is "
+-            "needed.\n\n"
+-            "Draft reply:\n\n",
++    context_block = build_rag_context(query, evidence.chunks)
++    prompt = _build_grounded_prompt(message, current_draft_text, context_block)
++    raw = AIService().call_ai_api(prompt, temperature=0.2)
++
++    parsed = _parse_structured_reply(raw)
++    if parsed is None:
++        # The model ignored the output contract. The text may still be a fine
++        # reply, but we cannot verify its grounding, so it needs review.
++        logger.warning(
++            "AI reply for message %s did not follow the JSON contract.", message.id
+         )
++        reply = GeneratedReply(body=(raw or "").strip(), needs_human_review=True)
+     else:
+-        prompt = _build_prompt(message, current_draft_text)
++        reply = _validate_structured_reply(parsed, len(evidence.chunks))
++
++    if not reply.body:
++        raise ValueError("AI response does not contain a reply body")
+ 
+-    return AIService().call_ai_api(prompt)
++    reply.evidence_status = evidence.status.value
++    reply.sources = evidence.sources_metadata()
++    reply.grounded = True
++    return reply
+ 
+ 
+ def generate_preview_reply_body(message: models.Message) -> str:
+@@ -355,10 +533,14 @@ class AIDraftView(APIView):
+         current_draft_text = request.data.get("currentDraftText")
+ 
+         if settings.AI_DRAFT_PREVIEW_ONLY:
+-            ai_reply = generate_preview_reply_body(source_message)
++            reply = GeneratedReply(
++                body=generate_preview_reply_body(source_message),
++                evidence_status="preview",
++                needs_human_review=True,
++            )
+         else:
+             try:
+-                ai_reply = generate_ai_reply_body_with_rag(
++                reply = generate_ai_reply_body_with_rag(
+                     source_message, current_draft_text
+                 )
+             except ImproperlyConfigured:
+@@ -366,15 +548,24 @@ class AIDraftView(APIView):
+                     "AI service is not configured; creating preview AI draft for message %s",
+                     message_id,
+                 )
+-                ai_reply = generate_preview_reply_body(source_message)
++                reply = GeneratedReply(
++                    body=generate_preview_reply_body(source_message),
++                    evidence_status=ai_rag.EvidenceStatus.NOT_CONFIGURED.value,
++                    needs_human_review=True,
++                )
+             except Exception as exc:
+                 logger.exception("Failed to generate AI draft for message %s", message_id)
+                 raise ServiceUnavailable("Failed to generate AI draft.") from exc
+ 
++        ai_metadata = reply.metadata()
++        # Logged with the draft id so a bad answer can be investigated later
++        # (which excerpts, which model, which prompt version).
++        logger.info("AI draft generated for message %s: %s", message_id, ai_metadata)
++
+         draft = create_draft(
+             mailbox=sender_mailbox,
+             subject=_reply_subject(source_message.subject),
+-            draft_body=_blocknote_paragraphs(ai_reply),
++            draft_body=_blocknote_paragraphs(reply.body),
+             parent_id=str(source_message.id),
+             to_emails=[source_message.sender.email],
+             cc_emails=[],
+@@ -386,7 +577,10 @@ class AIDraftView(APIView):
+         draft = models.Message.objects.with_read_state(sender_mailbox.id).get(
+             id=draft.id
+         )
+-        return Response(
+-            serializers.MessageSerializer(draft, context={"request": request}).data,
+-            status=status.HTTP_201_CREATED,
++        payload = dict(
++            serializers.MessageSerializer(draft, context={"request": request}).data
+         )
++        # Additive key: no schema migration, no breaking change for clients
++        # that ignore it. The composer can surface it when the UI is ready.
++        payload["aiMetadata"] = ai_metadata
++        return Response(payload, status=status.HTTP_201_CREATED)
+diff --git a/src/backend/core/evaluation/ai_draft_corpus.json b/src/backend/core/evaluation/ai_draft_corpus.json
+new file mode 100644
+index 00000000..b25cc3e6
+--- /dev/null
++++ b/src/backend/core/evaluation/ai_draft_corpus.json
+@@ -0,0 +1,44 @@
++[
++  {
++    "id": "cni-delai",
++    "question": "Bonjour, j'ai déposé une demande de renouvellement de carte nationale d'identité le mois dernier. Quel est le délai de traitement habituel ? Cordialement.",
++    "expected_keywords": ["carte nationale d'identité", "délai"],
++    "expected_document_ids": [],
++    "expect_human_review": false
++  },
++  {
++    "id": "justificatif-domicile",
++    "question": "Madame, Monsieur, quels justificatifs de domicile sont acceptés pour une demande de passeport ?",
++    "expected_keywords": ["justificatif de domicile", "passeport"],
++    "expected_document_ids": [],
++    "expect_human_review": false
++  },
++  {
++    "id": "rupture-conventionnelle",
++    "question": "Bonjour, mon employeur me propose une rupture conventionnelle. Ai-je droit à l'allocation chômage ensuite ?",
++    "expected_keywords": ["rupture conventionnelle", "allocation"],
++    "expected_document_ids": [],
++    "expect_human_review": false
++  },
++  {
++    "id": "dossier-individuel-hors-perimetre",
++    "question": "Bonjour, où en est mon dossier numéro 2024-XR-8891 ? Je n'ai pas eu de nouvelles depuis six semaines.",
++    "expected_keywords": [],
++    "expected_document_ids": [],
++    "expect_human_review": true
++  },
++  {
++    "id": "question-hors-sujet",
++    "question": "Bonjour, pouvez-vous me recommander un bon restaurant près de la mairie ?",
++    "expected_keywords": [],
++    "expected_document_ids": [],
++    "expect_human_review": true
++  },
++  {
++    "id": "demande-multi-parties",
++    "question": "Bonjour, je souhaite connaître les pièces à fournir pour un renouvellement de titre de séjour, et savoir si mon rendez-vous du 12 mars peut être décalé.",
++    "expected_keywords": ["titre de séjour"],
++    "expected_document_ids": [],
++    "expect_human_review": false
++  }
++]
+diff --git a/src/backend/core/management/commands/ai_draft_eval.py b/src/backend/core/management/commands/ai_draft_eval.py
+new file mode 100644
+index 00000000..01628fa0
+--- /dev/null
++++ b/src/backend/core/management/commands/ai_draft_eval.py
+@@ -0,0 +1,157 @@
++"""Evaluate the AI reply retrieval pipeline against a small corpus.
++
++Albert's own guidance is that reranking may be counterproductive on a given
++corpus, so this command exists to measure it rather than assume it.
++
++Corpus format (JSON list)::
++
++    [
++      {
++        "id": "carte-identite-delai",
++        "question": "Bonjour, quel est le délai pour refaire ma carte d'identité ?",
++        "expected_keywords": ["délai", "instruction"],
++        "expected_document_ids": ["doc-123"],
++        "expect_human_review": false
++      }
++    ]
++
++Usage::
++
++    python manage.py ai_draft_eval --corpus core/evaluation/ai_draft_corpus.json
++    python manage.py ai_draft_eval --corpus ... --no-rerank   # baseline
++"""
++
++import json
++from pathlib import Path
++
++from django.core.management.base import BaseCommand, CommandError
++from django.test import override_settings
++
++from core.services.ai_rag import EvidenceStatus, retrieve_evidence
++
++
++class Command(BaseCommand):
++    """Run the retrieval pipeline over a corpus and report retrieval quality."""
++
++    help = "Evaluate the AI draft retrieval pipeline on a corpus of citizen emails."
++
++    def add_arguments(self, parser):
++        """Declare CLI arguments."""
++        parser.add_argument("--corpus", required=True, help="Path to the JSON corpus.")
++        parser.add_argument(
++            "--no-rerank",
++            action="store_true",
++            help="Disable reranking, to compare against the raw search baseline.",
++        )
++        parser.add_argument(
++            "--json", action="store_true", help="Emit machine-readable results."
++        )
++
++    def handle(self, *args, **options):
++        """Run the evaluation."""
++        path = Path(options["corpus"])
++        if not path.is_file():
++            raise CommandError(f"Corpus not found: {path}")
++
++        try:
++            cases = json.loads(path.read_text(encoding="utf-8"))
++        except json.JSONDecodeError as exc:
++            raise CommandError(f"Invalid JSON corpus: {exc}") from exc
++        if not isinstance(cases, list) or not cases:
++            raise CommandError("Corpus must be a non-empty JSON list.")
++
++        overrides = {"AI_RAG_RERANK_MODEL": ""} if options["no_rerank"] else {}
++        with override_settings(**overrides):
++            results = [self._evaluate(case) for case in cases]
++
++        if options["json"]:
++            self.stdout.write(json.dumps(results, ensure_ascii=False, indent=2))
++            return
++
++        self._report(results, reranked=not options["no_rerank"])
++
++    def _evaluate(self, case: dict) -> dict:
++        """Run one case through the retrieval pipeline."""
++        question = (case.get("question") or "").strip()
++        evidence = retrieve_evidence(question)
++
++        excerpts = " ".join(chunk["content"].lower() for chunk in evidence.chunks)
++        keywords = [kw.lower() for kw in case.get("expected_keywords") or []]
++        hits = [kw for kw in keywords if kw in excerpts]
++
++        found_docs = {
++            str(chunk.get("document_id")) for chunk in evidence.chunks
++        }
++        expected_docs = {str(d) for d in case.get("expected_document_ids") or []}
++
++        expects_review = bool(case.get("expect_human_review"))
++        got_review = not evidence.has_evidence
++
++        return {
++            "id": case.get("id") or question[:40],
++            "status": evidence.status.value,
++            "candidates": evidence.candidates_count,
++            "kept": len(evidence.chunks),
++            "reranked": evidence.reranked,
++            "keyword_recall": (len(hits) / len(keywords)) if keywords else None,
++            "missing_keywords": [kw for kw in keywords if kw not in hits],
++            "document_recall": (
++                len(expected_docs & found_docs) / len(expected_docs)
++                if expected_docs
++                else None
++            ),
++            "review_expected": expects_review,
++            "review_triggered": got_review,
++            "review_correct": expects_review == got_review,
++            "top_rerank_score": (
++                evidence.chunks[0].get("rerank_score") if evidence.chunks else None
++            ),
++        }
++
++    def _report(self, results: list[dict], reranked: bool) -> None:
++        """Print a human-readable summary."""
++        total = len(results)
++        answered = sum(1 for r in results if r["status"] == EvidenceStatus.OK.value)
++        review_correct = sum(1 for r in results if r["review_correct"])
++        keyword_scores = [
++            r["keyword_recall"] for r in results if r["keyword_recall"] is not None
++        ]
++        doc_scores = [
++            r["document_recall"] for r in results if r["document_recall"] is not None
++        ]
++
++        mode = "reranked" if reranked else "search-only baseline"
++        self.stdout.write(self.style.MIGRATE_HEADING(f"\nPipeline: {mode}"))
++        self.stdout.write(f"Cases                : {total}")
++        self.stdout.write(f"Answered with evidence: {answered}/{total}")
++        self.stdout.write(f"Correct review gate  : {review_correct}/{total}")
++        if keyword_scores:
++            self.stdout.write(
++                f"Mean keyword recall  : {sum(keyword_scores) / len(keyword_scores):.2f}"
++            )
++        if doc_scores:
++            self.stdout.write(
++                f"Mean document recall : {sum(doc_scores) / len(doc_scores):.2f}"
++            )
++
++        failures = [r for r in results if not r["review_correct"]]
++        if failures:
++            self.stdout.write(self.style.WARNING("\nReview-gate mismatches:"))
++            for result in failures:
++                self.stdout.write(
++                    f"  - {result['id']}: status={result['status']} "
++                    f"expected_review={result['review_expected']}"
++                )
++
++        weak = [
++            r
++            for r in results
++            if r["keyword_recall"] is not None and r["keyword_recall"] < 1
++        ]
++        if weak:
++            self.stdout.write(self.style.WARNING("\nIncomplete keyword coverage:"))
++            for result in weak:
++                self.stdout.write(
++                    f"  - {result['id']}: missing {result['missing_keywords']}"
++                )
++        self.stdout.write("")
+diff --git a/src/backend/core/services/ai_rag.py b/src/backend/core/services/ai_rag.py
+new file mode 100644
+index 00000000..bd2352c7
+--- /dev/null
++++ b/src/backend/core/services/ai_rag.py
+@@ -0,0 +1,158 @@
++"""Evidence retrieval pipeline for AI-generated replies.
++
++Flow: Albert ``/v1/search`` (broad candidate set) -> ``/v1/rerank`` (precision)
++-> evidence gate. The gate is the important part: when no excerpt is relevant
++enough, the caller must *not* produce a factual answer, because an ungrounded
++answer to a citizen about deadlines, eligibility or fees is worse than no
++answer at all.
++"""
++
++import logging
++from dataclasses import dataclass, field
++from enum import Enum
++
++import requests
++from django.conf import settings
++from django.core.exceptions import ImproperlyConfigured
++
++from core.services.ai_service import AIService
++
++logger = logging.getLogger(__name__)
++
++
++class EvidenceStatus(str, Enum):
++    """Outcome of the retrieval pipeline."""
++
++    OK = "ok"
++    NO_RESULTS = "no_results"
++    NOT_RELEVANT = "not_relevant"
++    UNAVAILABLE = "unavailable"
++    NOT_CONFIGURED = "not_configured"
++    EMPTY_QUERY = "empty_query"
++
++
++@dataclass
++class Evidence:
++    """Excerpts retained for generation, plus why they were retained."""
++
++    status: EvidenceStatus = EvidenceStatus.NO_RESULTS
++    chunks: list[dict] = field(default_factory=list)
++    candidates_count: int = 0
++    reranked: bool = False
++
++    @property
++    def has_evidence(self) -> bool:
++        """True when at least one excerpt passed the relevance gate."""
++        return bool(self.chunks)
++
++    def sources_metadata(self) -> list[dict]:
++        """Reviewable provenance for each retained excerpt."""
++        return [
++            {
++                "index": position,
++                "collection_id": chunk.get("collection_id"),
++                "document_id": chunk.get("document_id"),
++                "document_name": chunk.get("document_name"),
++                "chunk_id": chunk.get("chunk_id"),
++                "search_score": chunk.get("search_score"),
++                "rerank_score": chunk.get("rerank_score"),
++                "excerpt": chunk.get("content"),
++            }
++            for position, chunk in enumerate(self.chunks, start=1)
++        ]
++
++
++def _apply_rerank(query: str, candidates: list[dict], top_n: int) -> tuple[list[dict], bool]:
++    """Return ``(chunks, reranked)`` after the Albert reranking step.
++
++    On any reranker failure we degrade to the raw search order rather than
++    dropping the whole RAG context; the relevance gate below then simply has no
++    rerank score to check.
++    """
++    if not settings.AI_RAG_RERANK_MODEL:
++        return candidates[:top_n], False
++
++    documents = [chunk["content"] for chunk in candidates]
++    try:
++        results = AIService().rerank(query, documents, top_n)
++    except (requests.RequestException, ValueError, KeyError):
++        logger.exception("Albert rerank failed; falling back to raw search order.")
++        return candidates[:top_n], False
++
++    if not results:
++        return candidates[:top_n], False
++
++    ranked = []
++    for result in results:
++        chunk = dict(candidates[result["index"]])
++        chunk["rerank_score"] = result.get("relevance_score")
++        ranked.append(chunk)
++    return ranked[:top_n], True
++
++
++def _passes_relevance_gate(chunk: dict, reranked: bool) -> bool:
++    """Keep an excerpt only if the reranker scored it above the threshold.
++
++    Albert documents ``score_threshold`` as semantic-search only, so we never
++    threshold the raw hybrid search score — only the reranker's own relevance
++    score, which is comparable across queries.
++    """
++    if not reranked:
++        return True
++    score = chunk.get("rerank_score")
++    if score is None:
++        return True
++    return float(score) >= settings.AI_RAG_MIN_RELEVANCE_SCORE
++
++
++def retrieve_evidence(query: str) -> Evidence:
++    """Retrieve, rerank and filter the excerpts backing a reply."""
++    query = (query or "").strip()
++    if not query:
++        return Evidence(status=EvidenceStatus.EMPTY_QUERY)
++
++    try:
++        candidates = AIService().search_chunks(
++            query, limit=settings.AI_RAG_SEARCH_CANDIDATES
++        )
++    except ImproperlyConfigured:
++        logger.warning("Albert API not configured; no evidence retrieved.")
++        return Evidence(status=EvidenceStatus.NOT_CONFIGURED)
++    except (requests.RequestException, ValueError, KeyError):
++        logger.exception("Albert search failed; no evidence retrieved.")
++        return Evidence(status=EvidenceStatus.UNAVAILABLE)
++
++    if not candidates:
++        logger.info("Albert search returned no chunk for query: %s", query[:200])
++        return Evidence(status=EvidenceStatus.NO_RESULTS)
++
++    ranked, reranked = _apply_rerank(
++        query, candidates, settings.AI_RAG_CONTEXT_LIMIT
++    )
++    kept = [chunk for chunk in ranked if _passes_relevance_gate(chunk, reranked)]
++
++    if not kept:
++        logger.info(
++            "Albert rerank kept no chunk above %.2f (%d candidates) for query: %s",
++            settings.AI_RAG_MIN_RELEVANCE_SCORE,
++            len(candidates),
++            query[:200],
++        )
++        return Evidence(
++            status=EvidenceStatus.NOT_RELEVANT,
++            candidates_count=len(candidates),
++            reranked=reranked,
++        )
++
++    logger.info(
++        "Albert RAG: %d candidates -> %d excerpts (reranked=%s)",
++        len(candidates),
++        len(kept),
++        reranked,
++    )
++    return Evidence(
++        status=EvidenceStatus.OK,
++        chunks=kept,
++        candidates_count=len(candidates),
++        reranked=reranked,
++    )
+diff --git a/src/backend/core/services/ai_service.py b/src/backend/core/services/ai_service.py
+index 89088c05..65bb3842 100644
+--- a/src/backend/core/services/ai_service.py
++++ b/src/backend/core/services/ai_service.py
+@@ -73,9 +73,55 @@ class AIService:
+                 f"Albert API {response.status_code} on {response.url}: {response.text[:500]}"
+             ) from exc
+ 
+-    def search_chunks(self, question: str) -> list[dict]:
++    @staticmethod
++    def _collection_ids(collection_ids: list | None = None) -> list:
++        """Return the collection ids to search, without mutating settings.
++
++        ``settings.AI_COLLECTION_IDS`` is a shared list: appending the private
++        collection to it directly made it grow on every single request.
++        """
++        if collection_ids is not None:
++            return [str(cid) for cid in collection_ids if cid]
++        ids = list(settings.AI_COLLECTION_IDS or [])
++        if settings.AI_PRIVATE_COLLECTION_ID:
++            ids.append(settings.AI_PRIVATE_COLLECTION_ID)
++        return [str(cid) for cid in ids if cid]
++
++    @staticmethod
++    def _normalize_search_result(result: dict) -> dict | None:
++        """Flatten one Albert search hit into a chunk dict carrying provenance.
++
++        Keeping the collection/document/chunk ids (and not only the text) is
++        what makes a generated draft auditable afterwards.
++        """
++        chunk = result.get("chunk") or {}
++        content = (chunk.get("content") or "").strip()
++        if not content:
++            return None
++        metadata = chunk.get("metadata") or {}
++        return {
++            "content": content,
++            "chunk_id": chunk.get("id"),
++            "document_id": chunk.get("document_id") or metadata.get("document_id"),
++            "collection_id": chunk.get("collection_id")
++            or metadata.get("collection_id"),
++            "document_name": metadata.get("document_name") or metadata.get("name"),
++            "search_score": result.get("score"),
++            "search_method": result.get("method"),
++            "rerank_score": None,
++        }
++
++    def search_chunks(
++        self,
++        question: str,
++        limit: int | None = None,
++        collection_ids: list | None = None,
++    ) -> list[dict]:
+         """Search relevant chunks in the Albert API vector store.
+ 
++        Returns a list of normalized chunk dicts (text + provenance + score),
++        ordered as returned by Albert.
++
+         The query must be a non-empty, non-whitespace string, otherwise the API
+         answers 422 Unprocessable Entity.
+         """
+@@ -83,19 +129,16 @@ class AIService:
+         if not question:
+             # Ne jamais appeler l'API avec une requête vide : c'est un 422 garanti.
+             return []
+-        logger.debug(f"{settings}")
++
+         payload = {
+-            "query": question[:settings.AI_QUERY_MAX_CHARS],
+-            "method": settings.AI_SEARCH_METHOD,
+-            "limit": settings.AI_SEARCH_LIMIT,
++            "query": question[: settings.AI_QUERY_MAX_CHARS],
++            "method": settings.AI_SEARCH_METHOD or "semantic",
++            "limit": limit or settings.AI_SEARCH_LIMIT,
+         }
+-        if settings.AI_COLLECTION_IDS:
+-            logger.critical(f"settings.AI_COLLECTION_IDS: {settings.AI_COLLECTION_IDS}, {type(settings.AI_COLLECTION_IDS)}")
+-            collections_ids = settings.AI_COLLECTION_IDS
+-            if settings.AI_PRIVATE_COLLECTION_ID:
+-                collections_ids.append(settings.AI_PRIVATE_COLLECTION_ID)
+-            logger.critical(f'COLLECTIONS IDS USED: {collections_ids}')
+-            payload["collection_ids"] = collections_ids
++        ids = self._collection_ids(collection_ids)
++        if ids:
++            payload["collection_ids"] = ids
++        logger.debug("Albert search: limit=%s collections=%s", payload["limit"], ids)
+ 
+         response = requests.post(
+             url=f"{settings.AI_BASE_URL}/search",
+@@ -105,16 +148,64 @@ class AIService:
+         )
+         self.__check_response(response)
+         # Réponse : {"object": "list", "data": [{"method", "score", "chunk": {...}}, ...]}
+-        return response.json()["data"]
++        results = response.json().get("data") or []
++        chunks = [self._normalize_search_result(result) for result in results]
++        return [chunk for chunk in chunks if chunk]
++
++    def rerank(self, query: str, documents: list[str], top_n: int) -> list[dict]:
++        """Reorder ``documents`` by relevance to ``query`` via POST /v1/rerank.
++
++        Albert follows the Cohere v2 rerank convention and answers
++        ``{"results": [{"index": int, "relevance_score": float}, ...]}``.
++        The returned list keeps that shape, filtered to valid indexes.
++        """
++        query = (query or "").strip()
++        if not query or not documents:
++            return []
++
++        response = requests.post(
++            url=f"{settings.AI_BASE_URL}/rerank",
++            headers=self.headers,
++            json={
++                "model": settings.AI_RAG_RERANK_MODEL,
++                "query": query[: settings.AI_QUERY_MAX_CHARS],
++                "documents": documents,
++                "top_n": min(top_n, len(documents)),
++            },
++            timeout=60,
++        )
++        self.__check_response(response)
++        payload = response.json()
++        results = payload.get("results")
++        if results is None:
++            # Certaines passerelles renvoient la liste sous "data".
++            results = payload.get("data") or []
++        return [
++            result
++            for result in results
++            if isinstance(result.get("index"), int)
++            and 0 <= result["index"] < len(documents)
++        ]
++
++    def call_ai_api(self, prompt, system_prompt: str | None = None, temperature=None):
++        """Helper method to call the OpenAI API and process the response.
++
++        ``system_prompt`` and ``temperature`` are optional so existing callers
++        (summarizer, classifier) keep working unchanged.
++        """
++        messages = []
++        if system_prompt:
++            messages.append({"role": "system", "content": system_prompt})
++        messages.append({"role": "user", "content": prompt})
+ 
+-    def call_ai_api(self, prompt):
+-        """Helper method to call the OpenAI API and process the response."""
+         data = {
+             "model": settings.AI_MODEL,
+-            "messages": [{"role": "user", "content": prompt}],
++            "messages": messages,
+ #            "stream": False,
+ #            "n": 1,
+         }
++        if temperature is not None:
++            data["temperature"] = temperature
+ 
+         try:
+             response = self.client.chat.completions.create(**data)
+diff --git a/src/backend/core/tests/services/test_ai_draft_generation.py b/src/backend/core/tests/services/test_ai_draft_generation.py
+new file mode 100644
+index 00000000..91a04719
+--- /dev/null
++++ b/src/backend/core/tests/services/test_ai_draft_generation.py
+@@ -0,0 +1,208 @@
++"""Tests for the grounded AI draft generation contract."""
++
++# pylint: disable=redefined-outer-name
++
++from unittest import mock
++
++import pytest
++from django.test import override_settings
++
++from core.api.viewsets import ai_draft
++from core.api.viewsets.ai_draft import (
++    SAFE_DRAFT_BODY,
++    _parse_structured_reply,
++    _validate_structured_reply,
++    generate_ai_reply_body_with_rag,
++)
++from core.services.ai_rag import Evidence, EvidenceStatus
++
++pytestmark = pytest.mark.django_db
++
++
++def _chunk(content="extrait officiel", chunk_id="c1"):
++    return {
++        "content": content,
++        "chunk_id": chunk_id,
++        "document_id": "doc-1",
++        "collection_id": "col-1",
++        "document_name": "service-public.pdf",
++        "search_score": 0.5,
++        "rerank_score": 0.9,
++    }
++
++
++@pytest.fixture
++def message():
++    """A minimal stand-in for the source message."""
++    source = mock.Mock()
++    source.id = "11111111-1111-1111-1111-111111111111"
++    source.thread_id = None
++    source.get_as_text.return_value = "Bonjour, quel est le délai de traitement ?"
++    return source
++
++
++@pytest.fixture
++def ai_service():
++    """Patch the AI service used for generation."""
++    with mock.patch.object(ai_draft, "AIService") as factory:
++        yield factory.return_value
++
++
++# --- structured output parsing ------------------------------------------------
++
++
++def test_parse_plain_json():
++    """A bare JSON object is parsed."""
++    parsed = _parse_structured_reply('{"body": "Bonjour", "source_indexes": [1]}')
++    assert parsed["body"] == "Bonjour"
++
++
++def test_parse_json_inside_markdown_fence():
++    """A fenced JSON object is parsed despite the contract forbidding fences."""
++    parsed = _parse_structured_reply('```json\n{"body": "Bonjour"}\n```')
++    assert parsed["body"] == "Bonjour"
++
++
++def test_parse_json_with_surrounding_prose():
++    """A JSON object wrapped in chatter is still recovered."""
++    parsed = _parse_structured_reply('Voici :\n{"body": "Bonjour"}\nMerci.')
++    assert parsed["body"] == "Bonjour"
++
++
++def test_parse_non_json_returns_none():
++    """Free text is not mistaken for a structured answer."""
++    assert _parse_structured_reply("Madame, Monsieur, ...") is None
++
++
++def test_validate_drops_out_of_range_source_indexes():
++    """Hallucinated excerpt numbers are discarded."""
++    reply = _validate_structured_reply(
++        {"body": "ok", "source_indexes": [1, 7, "2", None]}, excerpt_count=3
++    )
++    assert reply.source_indexes == [1, 2]
++
++
++def test_validate_flags_unanswered_points_for_review():
++    """Any uncovered point forces human review."""
++    reply = _validate_structured_reply(
++        {
++            "body": "ok",
++            "needs_human_review": False,
++            "unanswered_points": ["montant exact de l'aide"],
++            "source_indexes": [1],
++        },
++        excerpt_count=2,
++    )
++    assert reply.needs_human_review is True
++
++
++def test_validate_flags_answer_citing_no_excerpt():
++    """A grounded answer that cites nothing is treated as unsupported."""
++    reply = _validate_structured_reply(
++        {"body": "ok", "needs_human_review": False, "source_indexes": []},
++        excerpt_count=3,
++    )
++    assert reply.needs_human_review is True
++
++
++# --- generation ---------------------------------------------------------------
++
++
++@override_settings(AI_RAG_REQUIRE_EVIDENCE=True)
++def test_no_evidence_returns_safe_draft(message, ai_service):
++    """Without evidence, no factual answer is generated at all."""
++    with mock.patch.object(
++        ai_draft.ai_rag,
++        "retrieve_evidence",
++        return_value=Evidence(status=EvidenceStatus.NO_RESULTS),
++    ):
++        reply = generate_ai_reply_body_with_rag(message)
++
++    assert reply.body == SAFE_DRAFT_BODY
++    assert reply.needs_human_review is True
++    assert reply.grounded is False
++    ai_service.call_ai_api.assert_not_called()
++
++
++@override_settings(AI_RAG_REQUIRE_EVIDENCE=True)
++def test_weak_evidence_returns_safe_draft(message, ai_service):
++    """Evidence rejected by the relevance gate also yields the safe draft."""
++    with mock.patch.object(
++        ai_draft.ai_rag,
++        "retrieve_evidence",
++        return_value=Evidence(status=EvidenceStatus.NOT_RELEVANT),
++    ):
++        reply = generate_ai_reply_body_with_rag(message)
++
++    assert reply.body == SAFE_DRAFT_BODY
++    assert reply.evidence_status == EvidenceStatus.NOT_RELEVANT.value
++    ai_service.call_ai_api.assert_not_called()
++
++
++@override_settings(AI_RAG_REQUIRE_EVIDENCE=False)
++def test_ungrounded_reply_is_flagged_when_evidence_not_required(message, ai_service):
++    """Opting out of the gate still marks the draft as unverified."""
++    ai_service.call_ai_api.return_value = "Madame, Monsieur, ..."
++    with mock.patch.object(
++        ai_draft.ai_rag,
++        "retrieve_evidence",
++        return_value=Evidence(status=EvidenceStatus.NO_RESULTS),
++    ):
++        reply = generate_ai_reply_body_with_rag(message)
++
++    assert reply.grounded is False
++    assert reply.needs_human_review is True
++
++
++def test_grounded_reply_carries_excerpts_and_sources(message, ai_service):
++    """A grounded answer keeps the excerpts in the prompt and in the metadata."""
++    evidence = Evidence(
++        status=EvidenceStatus.OK,
++        chunks=[_chunk("Le délai est de deux mois.")],
++        candidates_count=25,
++        reranked=True,
++    )
++    ai_service.call_ai_api.return_value = (
++        '{"body": "Madame, Monsieur,\\n\\nLe délai est de deux mois.", '
++        '"needs_human_review": false, "unanswered_points": [], '
++        '"source_indexes": [1]}'
++    )
++    with mock.patch.object(
++        ai_draft.ai_rag, "retrieve_evidence", return_value=evidence
++    ):
++        reply = generate_ai_reply_body_with_rag(message)
++
++    prompt = ai_service.call_ai_api.call_args.args[0]
++    assert "Le délai est de deux mois." in prompt
++    assert "[Extrait 1]" in prompt
++    assert reply.grounded is True
++    assert reply.needs_human_review is False
++    assert reply.source_indexes == [1]
++
++    metadata = reply.metadata()
++    assert metadata["sources"][0]["used"] is True
++    assert metadata["sources"][0]["chunk_id"] == "c1"
++
++
++def test_unstructured_model_answer_is_flagged_for_review(message, ai_service):
++    """If the model ignores the JSON contract, the draft needs review."""
++    evidence = Evidence(status=EvidenceStatus.OK, chunks=[_chunk()])
++    ai_service.call_ai_api.return_value = "Madame, Monsieur, voici la réponse."
++    with mock.patch.object(
++        ai_draft.ai_rag, "retrieve_evidence", return_value=evidence
++    ):
++        reply = generate_ai_reply_body_with_rag(message)
++
++    assert reply.body == "Madame, Monsieur, voici la réponse."
++    assert reply.needs_human_review is True
++
++
++def test_empty_body_raises(message, ai_service):
++    """An empty body is an error, never an empty draft sent to a citizen."""
++    evidence = Evidence(status=EvidenceStatus.OK, chunks=[_chunk()])
++    ai_service.call_ai_api.return_value = '{"body": "   "}'
++    with mock.patch.object(
++        ai_draft.ai_rag, "retrieve_evidence", return_value=evidence
++    ):
++        with pytest.raises(ValueError):
++            generate_ai_reply_body_with_rag(message)
+diff --git a/src/backend/core/tests/services/test_ai_rag.py b/src/backend/core/tests/services/test_ai_rag.py
+new file mode 100644
+index 00000000..29486cf4
+--- /dev/null
++++ b/src/backend/core/tests/services/test_ai_rag.py
+@@ -0,0 +1,145 @@
++"""Tests for the RAG evidence retrieval pipeline."""
++
++# pylint: disable=redefined-outer-name
++
++from unittest import mock
++
++import pytest
++import requests
++from django.core.exceptions import ImproperlyConfigured
++from django.test import override_settings
++
++from core.services import ai_rag
++from core.services.ai_rag import EvidenceStatus, retrieve_evidence
++
++pytestmark = pytest.mark.django_db
++
++
++def _chunk(content, chunk_id="c1", score=0.5):
++    """Build a normalized search result as AIService.search_chunks returns it."""
++    return {
++        "content": content,
++        "chunk_id": chunk_id,
++        "document_id": "doc-1",
++        "collection_id": "col-1",
++        "document_name": "service-public.pdf",
++        "search_score": score,
++        "search_method": "semantic",
++        "rerank_score": None,
++    }
++
++
++@pytest.fixture
++def service():
++    """Patch AIService as used by the pipeline."""
++    with mock.patch.object(ai_rag, "AIService") as factory:
++        yield factory.return_value
++
++
++@override_settings(AI_RAG_SEARCH_CANDIDATES=25, AI_RAG_CONTEXT_LIMIT=3)
++def test_retrieve_evidence_requests_a_broad_candidate_set(service):
++    """A broad candidate set must be requested, not the small default limit."""
++    service.search_chunks.return_value = [_chunk("a")]
++    service.rerank.return_value = [{"index": 0, "relevance_score": 0.9}]
++
++    retrieve_evidence("Comment renouveler ma carte d'identité ?")
++
++    assert service.search_chunks.call_args.kwargs["limit"] == 25
++
++
++@override_settings(AI_RAG_CONTEXT_LIMIT=2, AI_RAG_MIN_RELEVANCE_SCORE=0.3)
++def test_retrieve_evidence_reorders_and_truncates_by_rerank_score(service):
++    """Excerpts are returned in reranked order, truncated to the context limit."""
++    service.search_chunks.return_value = [
++        _chunk("first", chunk_id="c1"),
++        _chunk("second", chunk_id="c2"),
++        _chunk("third", chunk_id="c3"),
++    ]
++    service.rerank.return_value = [
++        {"index": 2, "relevance_score": 0.95},
++        {"index": 0, "relevance_score": 0.71},
++    ]
++
++    evidence = retrieve_evidence("question")
++
++    assert evidence.status == EvidenceStatus.OK
++    assert evidence.reranked is True
++    assert [chunk["chunk_id"] for chunk in evidence.chunks] == ["c3", "c1"]
++    assert evidence.chunks[0]["rerank_score"] == 0.95
++
++
++@override_settings(AI_RAG_MIN_RELEVANCE_SCORE=0.5)
++def test_retrieve_evidence_rejects_weak_evidence(service):
++    """Chunks scored below the threshold must not become context."""
++    service.search_chunks.return_value = [_chunk("loosely related")]
++    service.rerank.return_value = [{"index": 0, "relevance_score": 0.12}]
++
++    evidence = retrieve_evidence("question")
++
++    assert evidence.status == EvidenceStatus.NOT_RELEVANT
++    assert evidence.has_evidence is False
++
++
++def test_retrieve_evidence_without_results(service):
++    """An empty search result is reported as such."""
++    service.search_chunks.return_value = []
++
++    assert retrieve_evidence("question").status == EvidenceStatus.NO_RESULTS
++
++
++def test_retrieve_evidence_when_albert_is_unavailable(service):
++    """A failing search degrades to 'unavailable' instead of raising."""
++    service.search_chunks.side_effect = requests.RequestException("boom")
++
++    assert retrieve_evidence("question").status == EvidenceStatus.UNAVAILABLE
++
++
++def test_retrieve_evidence_when_albert_is_not_configured(service):
++    """A missing API key is reported without raising."""
++    service.search_chunks.side_effect = ImproperlyConfigured
++
++    assert retrieve_evidence("question").status == EvidenceStatus.NOT_CONFIGURED
++
++
++def test_retrieve_evidence_with_empty_query(service):
++    """An empty query never reaches Albert (guaranteed 422)."""
++    assert retrieve_evidence("   ").status == EvidenceStatus.EMPTY_QUERY
++    service.search_chunks.assert_not_called()
++
++
++@override_settings(AI_RAG_CONTEXT_LIMIT=2)
++def test_rerank_failure_falls_back_to_search_order(service):
++    """A reranker outage must not drop the whole RAG context."""
++    service.search_chunks.return_value = [_chunk("a", "c1"), _chunk("b", "c2")]
++    service.rerank.side_effect = requests.RequestException("boom")
++
++    evidence = retrieve_evidence("question")
++
++    assert evidence.status == EvidenceStatus.OK
++    assert evidence.reranked is False
++    assert len(evidence.chunks) == 2
++
++
++@override_settings(AI_RAG_RERANK_MODEL="")
++def test_reranking_can_be_disabled(service):
++    """With no rerank model configured, search order is used directly."""
++    service.search_chunks.return_value = [_chunk("a")]
++
++    evidence = retrieve_evidence("question")
++
++    assert evidence.reranked is False
++    service.rerank.assert_not_called()
++
++
++def test_sources_metadata_exposes_provenance(service):
++    """Each retained excerpt keeps ids and scores for later review."""
++    service.search_chunks.return_value = [_chunk("a")]
++    service.rerank.return_value = [{"index": 0, "relevance_score": 0.9}]
++
++    source = retrieve_evidence("question").sources_metadata()[0]
++
++    assert source["collection_id"] == "col-1"
++    assert source["document_id"] == "doc-1"
++    assert source["chunk_id"] == "c1"
++    assert source["rerank_score"] == 0.9
++    assert source["excerpt"] == "a"
+diff --git a/src/backend/messages/settings.py b/src/backend/messages/settings.py
+index 9d9c7dd1..9a26040d 100644
+--- a/src/backend/messages/settings.py
++++ b/src/backend/messages/settings.py
+@@ -1360,7 +1360,9 @@ class Base(Configuration):
+         1000, environ_name="AI_QUERY_MAX_CHARS", environ_prefix=None
+     )
+     #string
+-    AI_SEARCH_METHOD = values.Value(None, environ_name="AI_SEARCH_METHOD", environ_prefix=None)
++    AI_SEARCH_METHOD = values.Value(
++        "semantic", environ_name="AI_SEARCH_METHOD", environ_prefix=None
++    )
+     #int
+     AI_SEARCH_LIMIT = values.PositiveIntegerValue(
+         10, environ_name="AI_SEARCH_LIMIT", environ_prefix=None
+@@ -1373,6 +1375,38 @@ class Base(Configuration):
+         None, environ_name="AI_PRIVATE_COLLECTION_ID", environ_prefix=None
+     )
+ 
++    # AI - RAG retrieval pipeline (search -> rerank -> evidence gate)
++    # Number of candidate chunks requested from Albert POST /v1/search before
++    # reranking. Albert recommends 20-50 candidates for a reranked pipeline.
++    AI_RAG_SEARCH_CANDIDATES = values.PositiveIntegerValue(
++        25, environ_name="AI_RAG_SEARCH_CANDIDATES", environ_prefix=None
++    )
++    # Number of excerpts actually sent to the generation model (Albert
++    # recommends top_n between 3 and 10).
++    AI_RAG_CONTEXT_LIMIT = values.PositiveIntegerValue(
++        5, environ_name="AI_RAG_CONTEXT_LIMIT", environ_prefix=None
++    )
++    # Reranking model id. Empty disables reranking and falls back to the raw
++    # search ordering (useful to A/B the pipeline on your own corpus).
++    AI_RAG_RERANK_MODEL = values.Value(
++        "openweight-rerank", environ_name="AI_RAG_RERANK_MODEL", environ_prefix=None
++    )
++    # Minimum reranker relevance_score for an excerpt to be considered usable
++    # evidence. Only applied to reranker scores, never to raw search scores.
++    AI_RAG_MIN_RELEVANCE_SCORE = values.FloatValue(
++        0.3, environ_name="AI_RAG_MIN_RELEVANCE_SCORE", environ_prefix=None
++    )
++    # When True, a reply with no usable evidence becomes a safe "human review"
++    # draft instead of a factual answer generated from the model's own memory.
++    AI_RAG_REQUIRE_EVIDENCE = values.BooleanValue(
++        default=True, environ_name="AI_RAG_REQUIRE_EVIDENCE", environ_prefix=None
++    )
++    # Bumped whenever the generation contract changes; stored with each draft
++    # so quality investigations can tell which prompt produced which answer.
++    AI_PROMPT_VERSION = values.Value(
++        "ai-draft-2026-09-rag-v2", environ_name="AI_PROMPT_VERSION", environ_prefix=None
++    )
++
+ 
+     # Entitlements
+     ENTITLEMENTS_BACKEND = values.Value(
+diff --git a/src/frontend/src/features/forms/components/message-form/index.tsx b/src/frontend/src/features/forms/components/message-form/index.tsx
+index 7adb8c93..519e3686 100644
+--- a/src/frontend/src/features/forms/components/message-form/index.tsx
++++ b/src/frontend/src/features/forms/components/message-form/index.tsx
+@@ -90,9 +90,32 @@ export type MessageFormHandle = {
+ 
+ const DRAFT_TOAST_ID = "MESSAGE_FORM_DRAFT_TOAST";
+ 
++type AiDraftSource = {
++    index: number;
++    collection_id: string | null;
++    document_id: string | null;
++    document_name: string | null;
++    chunk_id: string | null;
++    search_score: number | null;
++    rerank_score: number | null;
++    excerpt: string;
++    used: boolean;
++};
++
++type AiDraftMetadata = {
++    needsHumanReview: boolean;
++    unansweredPoints: string[];
++    evidenceStatus: string;
++    grounded: boolean;
++    model: string | null;
++    promptVersion: string | null;
++    rerankModel: string | null;
++    sources: AiDraftSource[];
++};
++
+ type AiDraftCreateResponse = {
+     status: number;
+-    data: Message;
++    data: Message & { aiMetadata?: AiDraftMetadata };
+     headers: Headers;
+ };
+ 
+@@ -468,12 +491,28 @@ export const MessageForm = forwardRef<MessageFormHandle, MessageFormProps>(({
+             }
+             invalidateMailbox();
+             invalidateThreadsStats();
+-            addToast(
+-                <ToasterItem type="info">
+-                    <span>{t("AI draft generated")}</span>
+-                </ToasterItem>,
+-                { toastId: DRAFT_TOAST_ID },
+-            );
++            const aiMetadata = (message as Message & { aiMetadata?: AiDraftMetadata }).aiMetadata;
++            if (aiMetadata?.needsHumanReview) {
++                // The draft is not fully backed by official sources: the agent
++                // must check it before sending, so never show a plain success.
++                addToast(
++                    <ToasterItem type="warning">
++                        <span>
++                            {aiMetadata.grounded
++                                ? t("AI draft generated, but some points are not covered by official sources. Please review before sending.")
++                                : t("No relevant official source was found. A holding reply was drafted: please complete it before sending.")}
++                        </span>
++                    </ToasterItem>,
++                    { toastId: DRAFT_TOAST_ID },
++                );
++            } else {
++                addToast(
++                    <ToasterItem type="info">
++                        <span>{t("AI draft generated from official sources")}</span>
++                    </ToasterItem>,
++                    { toastId: DRAFT_TOAST_ID },
++                );
++            }
+             return message;
+         } catch (error) {
+             addToast(

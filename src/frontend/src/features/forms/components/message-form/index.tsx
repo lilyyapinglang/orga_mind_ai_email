@@ -90,9 +90,32 @@ export type MessageFormHandle = {
 
 const DRAFT_TOAST_ID = "MESSAGE_FORM_DRAFT_TOAST";
 
+type AiDraftSource = {
+    index: number;
+    collection_id: string | null;
+    document_id: string | null;
+    document_name: string | null;
+    chunk_id: string | null;
+    search_score: number | null;
+    rerank_score: number | null;
+    excerpt: string;
+    used: boolean;
+};
+
+type AiDraftMetadata = {
+    needsHumanReview: boolean;
+    unansweredPoints: string[];
+    evidenceStatus: string;
+    grounded: boolean;
+    model: string | null;
+    promptVersion: string | null;
+    rerankModel: string | null;
+    sources: AiDraftSource[];
+};
+
 type AiDraftCreateResponse = {
     status: number;
-    data: Message;
+    data: Message & { aiMetadata?: AiDraftMetadata };
     headers: Headers;
 };
 
@@ -468,12 +491,28 @@ export const MessageForm = forwardRef<MessageFormHandle, MessageFormProps>(({
             }
             invalidateMailbox();
             invalidateThreadsStats();
-            addToast(
-                <ToasterItem type="info">
-                    <span>{t("AI draft generated")}</span>
-                </ToasterItem>,
-                { toastId: DRAFT_TOAST_ID },
-            );
+            const aiMetadata = (message as Message & { aiMetadata?: AiDraftMetadata }).aiMetadata;
+            if (aiMetadata?.needsHumanReview) {
+                // The draft is not fully backed by official sources: the agent
+                // must check it before sending, so never show a plain success.
+                addToast(
+                    <ToasterItem type="warning">
+                        <span>
+                            {aiMetadata.grounded
+                                ? t("AI draft generated, but some points are not covered by official sources. Please review before sending.")
+                                : t("No relevant official source was found. A holding reply was drafted: please complete it before sending.")}
+                        </span>
+                    </ToasterItem>,
+                    { toastId: DRAFT_TOAST_ID },
+                );
+            } else {
+                addToast(
+                    <ToasterItem type="info">
+                        <span>{t("AI draft generated from official sources")}</span>
+                    </ToasterItem>,
+                    { toastId: DRAFT_TOAST_ID },
+                );
+            }
             return message;
         } catch (error) {
             addToast(
