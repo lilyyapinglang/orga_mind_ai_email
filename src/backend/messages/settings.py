@@ -1355,6 +1355,19 @@ class Base(Configuration):
     AI_DRAFT_PREVIEW_ONLY = values.BooleanValue(
         default=False, environ_name="AI_DRAFT_PREVIEW_ONLY", environ_prefix=None
     )
+    AI_QUERY_MAX_CHARS = values.PositiveIntegerValue(
+        1000, environ_name="AI_QUERY_MAX_CHARS", environ_prefix=None
+    )
+    AI_SEARCH_METHOD = values.Value(None, environ_name="AI_SEARCH_METHOD", environ_prefix=None)
+    AI_SEARCH_LIMIT = values.PositiveIntegerValue(
+        10, environ_name="AI_SEARCH_LIMIT", environ_prefix=None
+    )
+    AI_COLLECTION_IDS = values.ListValue(
+        default=[], environ_name="AI_COLLECTION_IDS", environ_prefix=None
+    )
+    AI_PRIVATE_COLLECTION_ID = values.Value(
+        None, environ_name="AI_PRIVATE_COLLECTION_ID", environ_prefix=None
+    )
     # Docs: source of the documents imported into the private AI collection
     # (``manage.py private_collection --from-docs``).
     DOCS_USERNAME = values.Value(
@@ -1384,19 +1397,10 @@ class Base(Configuration):
         ),
         "timeout_seconds": 30,
     }
-    AI_QUERY_MAX_CHARS = values.PositiveIntegerValue(
-        1000, environ_name="AI_QUERY_MAX_CHARS", environ_prefix=None
+    DOCS_MAX_REDIRECTS = values.PositiveIntegerValue(
+        5, environ_name="DOCS_MAX_REDIRECTS", environ_prefix=None
     )
-    AI_SEARCH_METHOD = values.Value(None, environ_name="AI_SEARCH_METHOD", environ_prefix=None)
-    AI_SEARCH_LIMIT = values.PositiveIntegerValue(
-        10, environ_name="AI_SEARCH_LIMIT", environ_prefix=None
-    )
-    AI_COLLECTION_IDS = values.ListValue(
-        default=[], environ_name="AI_COLLECTION_IDS", environ_prefix=None
-    )
-    AI_PRIVATE_COLLECTION_ID = values.Value(
-        None, environ_name="AI_PRIVATE_COLLECTION_ID", environ_prefix=None
-    )
+
 
 
     # Entitlements

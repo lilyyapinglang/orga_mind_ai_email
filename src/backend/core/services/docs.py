@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 LOCAL_HOSTS = {"localhost", "127.0.0.1"}
 LOGIN_FORM_ACTION_RE = re.compile(r'<form[^>]*action="([^"]+)"')
-MAX_REDIRECTS = 10
 UNTITLED_DOCUMENT_TITLE = "Sans titre"
 
 
@@ -153,7 +152,7 @@ class DocsClient:
         ``should_follow(next_url)`` returning False stops on the redirect
         response. Its ``url`` is always the public URL, not the network one.
         """
-        for _ in range(MAX_REDIRECTS):
+        for _ in range(settings.DOCS_MAX_REDIRECTS):
             netloc = urllib.parse.urlsplit(url).netloc
             cookies = self._cookies.setdefault(netloc, {})
             headers = {"Host": netloc}
