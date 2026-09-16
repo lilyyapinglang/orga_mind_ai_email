@@ -1,174 +1,196 @@
-"""Service for AI-powered features using OpenAI-compatible API."""
-import mimetypes
-import logging
-import requests
-import json
-import os
-import ast
+"""Albert API client for AI features and grounded reply generation."""
 
+import logging
+from dataclasses import dataclass
+
+import requests
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
-
 from openai import OpenAI
 
 from core.ai.utils import is_ai_enabled
 
 logger = logging.getLogger(__name__)
 
-# Extensions et types MIME acceptés par POST /v1/documents
-ALLOWED_EXTENSIONS = {
-    ".pdf": "application/pdf",
-    ".txt": "text/plain",
-    ".html": "text/html",
-    ".htm": "text/html",
-    ".md": "text/markdown",
-    ".markdown": "text/markdown",
-}
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 Mo
+
+@dataclass(frozen=True)
+class RagChunk:
+    """A source excerpt returned by Albert, with its audit metadata."""
+
+    content: str
+    chunk_id: int
+    document_id: int
+    collection_id: int
+    search_score: float
+    rerank_score: float | None = None
+
+    def as_metadata(self) -> dict:
+        """Return serializable source provenance for the generated draft."""
+        return {
+            "chunk_id": self.chunk_id,
+            "document_id": self.document_id,
+            "collection_id": self.collection_id,
+            "search_score": self.search_score,
+            "rerank_score": self.rerank_score,
+            "excerpt": self.content,
+        }
+
 
 class AIService:
-    """Service class for AI-related operations."""
+    """Client for Albert's OpenAI-compatible chat and RAG endpoints."""
 
     def __init__(self):
-        """Ensure that the AI configuration is set properly."""
-        self.headers = {}
         if not is_ai_enabled():
             raise ImproperlyConfigured("AI configuration not set")
+        self.base_url = settings.AI_BASE_URL.rstrip("/")
+        self.headers = {"Authorization": f"Bearer {settings.AI_API_KEY}"}
         self.client = OpenAI(
-            base_url=settings.AI_BASE_URL,
+            base_url=self.base_url,
             api_key=settings.AI_API_KEY,
             timeout=60,
             max_retries=1,
         )
-        logger.info(f"settings data: {settings}")
-        self.__set_headers()
 
+    def call_ai_api(self, prompt: str, system_prompt: str | None = None) -> str:
+        """Call Albert chat completions and return its non-empty text content."""
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        response = self.client.chat.completions.create(
+            model=settings.AI_MODEL,
+            messages=messages,
+            stream=False,
+            n=1,
+        )
+        if not response.choices or not response.choices[0].message.content:
+            raise ValueError("AI response does not contain an answer")
+        return response.choices[0].message.content
 
-    def __set_headers(self) -> dict:
-        """Build API auth headers from settings/environment.
-
-        Raises ImproperlyConfigured so the caller can fall back gracefully.
-        """
-        api_key = settings.AI_API_KEY
-        if not api_key:
-            raise ImproperlyConfigured(
-                "AI_API_KEY is not configured (settings.AI_API_KEY or env var)."
-            )
-        self.headers = {"Authorization": f"Bearer {api_key}"}
-
-    def __check_response(self, response: requests.Response) -> None:
-        """Raise with the API's error detail included (a bare 422 hides the cause)."""
+    @staticmethod
+    def _collection_ids() -> list[int]:
+        """Return configured public and private collections without mutation."""
+        raw_ids = list(settings.AI_COLLECTION_IDS)
+        if settings.AI_PRIVATE_COLLECTION_ID:
+            raw_ids.append(settings.AI_PRIVATE_COLLECTION_ID)
         try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            # Le corps de la réponse 422 indique le champ invalide, ex. :
-            # {"detail":[{"type":"string_too_short","loc":["body","query"], ...}]}
-            logger.error(
-                "Albert API error %s on %s: %s",
-                response.status_code,
-                response.url,
-                response.text[:1000],
-            )
-            raise requests.HTTPError(
-                f"Albert API {response.status_code} on {response.url}: {response.text[:500]}"
+            collection_ids = [int(value) for value in raw_ids]
+        except (TypeError, ValueError) as exc:
+            raise ImproperlyConfigured(
+                "AI_COLLECTION_IDS and AI_PRIVATE_COLLECTION_ID must be integers"
             ) from exc
+        return list(dict.fromkeys(collection_ids))
 
-    def search_chunks(self, question: str) -> list[dict]:
-        """Search relevant chunks in the Albert API vector store.
+    @classmethod
+    def _collection_ids_for_query(cls, query: str) -> list[int]:
+        """Narrow retrieval when an administrator configured a topic route.
 
-        The query must be a non-empty, non-whitespace string, otherwise the API
-        answers 422 Unprocessable Entity.
+        Routes are deliberately declarative rather than guessed by an LLM. Each
+        entry is ``{"keywords": [...], "collection_ids": [...]}``.  The
+        private collection remains available for local procedures in every
+        route; without a match the configured full allowlist is used.
         """
-        question = (question or "").strip()
-        if not question:
-            # Ne jamais appeler l'API avec une requête vide : c'est un 422 garanti.
-            return []
-        logger.debug(f"{settings}")
-        payload = {
-            "query": question[:settings.AI_QUERY_MAX_CHARS],
-            "method": settings.AI_SEARCH_METHOD,
-            "limit": settings.AI_SEARCH_LIMIT,
-        }
-        if settings.AI_COLLECTION_IDS:
-            logger.critical(f"settings.AI_COLLECTION_IDS: {settings.AI_COLLECTION_IDS}, {type(settings.AI_COLLECTION_IDS)}")
-            collections_ids = settings.AI_COLLECTION_IDS
-            if settings.AI_PRIVATE_COLLECTION_ID:
-                collections_ids.append(settings.AI_PRIVATE_COLLECTION_ID)
-            logger.critical(f'COLLECTIONS IDS USED: {collections_ids}')
-            payload["collection_ids"] = collections_ids
+        all_ids = cls._collection_ids()
+        query = query.casefold()
+        routes = settings.AI_RAG_COLLECTION_ROUTES
+        if not isinstance(routes, list):
+            raise ImproperlyConfigured("AI_RAG_COLLECTION_ROUTES must be a JSON list")
+        for route in routes:
+            if not isinstance(route, dict):
+                continue
+            keywords = route.get("keywords", [])
+            route_ids = route.get("collection_ids", [])
+            if not isinstance(keywords, list) or not isinstance(route_ids, list):
+                continue
+            if any(isinstance(keyword, str) and keyword.casefold() in query for keyword in keywords):
+                try:
+                    selected = [int(value) for value in route_ids]
+                except (TypeError, ValueError) as exc:
+                    raise ImproperlyConfigured(
+                        "AI_RAG_COLLECTION_ROUTES collection_ids must be integers"
+                    ) from exc
+                if settings.AI_PRIVATE_COLLECTION_ID:
+                    selected.append(int(settings.AI_PRIVATE_COLLECTION_ID))
+                return list(dict.fromkeys(selected))
+        return all_ids
 
+    def search_chunks(self, query: str) -> list[RagChunk]:
+        """Retrieve a broad candidate set, scoped to known collections."""
+        query = (query or "").strip()
+        if not query:
+            return []
+        collection_ids = self._collection_ids_for_query(query)
+        if not collection_ids:
+            raise ImproperlyConfigured("At least one Albert RAG collection is required")
         response = requests.post(
-            url=f"{settings.AI_BASE_URL}/search",
+            f"{self.base_url}/search",
             headers=self.headers,
-            json=payload,
+            json={
+                "query": query[: settings.AI_QUERY_MAX_CHARS],
+                "collection_ids": collection_ids,
+                "method": settings.AI_SEARCH_METHOD,
+                "limit": settings.AI_RAG_CANDIDATE_LIMIT,
+            },
             timeout=60,
         )
-        self.__check_response(response)
-        # Réponse : {"object": "list", "data": [{"method", "score", "chunk": {...}}, ...]}
-        return response.json()["data"]
-
-    def call_ai_api(self, prompt):
-        """Helper method to call the OpenAI API and process the response."""
-        data = {
-            "model": settings.AI_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-#            "stream": False,
-#            "n": 1,
-        }
-
-        try:
-            response = self.client.chat.completions.create(**data)
-        except Exception:
-            logger.exception("AI API call failed")
-            raise
-
-        if not response.choices:
-            raise ValueError("AI response returned no choices")
-
-        content = response.choices[0].message.content
-
-        if not content:
-            raise ValueError("AI response does not contain an answer")
-
-        return content
-
-    def upload_document(self, file_path: str) -> int:
-        """Importe un fichier (PDF, TXT, HTML, MARKDOWN, max 20 Mo) dans la collection.
-
-        L'API extrait le texte, le découpe en chunks, les vectorise puis les stocke.
-        """
-        if not os.path.isfile(file_path):
-            raise FileNotFoundError(f"Fichier introuvable : {file_path}")
-
-        extension = os.path.splitext(file_path)[1].lower()
-        if extension not in ALLOWED_EXTENSIONS:
-            raise ValueError(
-                f"Format non accepté : '{extension or 'sans extension'}'. "
-                f"Formats autorisés : {', '.join(sorted(ALLOWED_EXTENSIONS))}"
-            )
-
-        file_size = os.path.getsize(file_path)
-        if file_size > MAX_FILE_SIZE:
-            raise ValueError(
-                f"Fichier trop volumineux : {file_size / (1024 * 1024):.1f} Mo "
-                f"(max {MAX_FILE_SIZE // (1024 * 1024)} Mo)"
-            )
-
-        # Type MIME déterminé depuis la liste blanche (prioritaire sur mimetypes,
-        # qui peut renvoyer None ou une valeur inattendue selon la plateforme)
-        mime_type = ALLOWED_EXTENSIONS[extension]
-
-        with open(file_path, "rb") as f:
-            response = requests.post(
-                url=f"{settings.AI_BASE_URL}/documents",
-                headers=self.headers,
-                files={"file": (os.path.basename(file_path), f, mime_type)},
-                data={"collection_id": str(settings.AI_PRIVATE_COLLECTION_ID)},
-                timeout=300,
-            )
         response.raise_for_status()
-        return response.json()["id"]
+        chunks = []
+        for result in response.json().get("data", []):
+            chunk = result.get("chunk", {}) if isinstance(result, dict) else {}
+            try:
+                content = chunk["content"].strip()
+                if content:
+                    chunks.append(
+                        RagChunk(
+                            content=content,
+                            chunk_id=int(chunk["id"]),
+                            document_id=int(chunk["document_id"]),
+                            collection_id=int(chunk["collection_id"]),
+                            search_score=float(result["score"]),
+                        )
+                    )
+            except (KeyError, TypeError, ValueError, AttributeError):
+                logger.warning("Ignoring malformed Albert search result")
+        return chunks
 
-    def get_private_collections(self) -> list:
-        """Return the dictionary of private collections."""
-        return settings.AI_PRIVATE_COLLECTION_ID
+    def rerank_chunks(self, query: str, chunks: list[RagChunk]) -> list[RagChunk]:
+        """Keep only strongly relevant excerpts from a broad search result."""
+        if not chunks:
+            return []
+        response = requests.post(
+            f"{self.base_url}/rerank",
+            headers=self.headers,
+            json={
+                "model": settings.AI_RAG_RERANK_MODEL,
+                "query": query,
+                "documents": [chunk.content for chunk in chunks],
+                "top_n": settings.AI_RAG_CONTEXT_LIMIT,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        ranked = []
+        for result in response.json().get("results", []):
+            try:
+                index = int(result["index"])
+                relevance = float(result["relevance_score"])
+                if relevance < settings.AI_RAG_MIN_RELEVANCE:
+                    continue
+                chunk = chunks[index]
+                ranked.append(
+                    RagChunk(
+                        content=chunk.content,
+                        chunk_id=chunk.chunk_id,
+                        document_id=chunk.document_id,
+                        collection_id=chunk.collection_id,
+                        search_score=chunk.search_score,
+                        rerank_score=relevance,
+                    )
+                )
+            except (KeyError, TypeError, ValueError, IndexError):
+                logger.warning("Ignoring malformed Albert rerank result")
+        return ranked
+
+    def retrieve_grounded_chunks(self, query: str) -> list[RagChunk]:
+        """Search broadly then rerank, returning only usable evidence."""
+        return self.rerank_chunks(query, self.search_chunks(query))

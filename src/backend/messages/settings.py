@@ -1355,17 +1355,27 @@ class Base(Configuration):
     AI_DRAFT_PREVIEW_ONLY = values.BooleanValue(
         default=False, environ_name="AI_DRAFT_PREVIEW_ONLY", environ_prefix=None
     )
-    #int
     AI_QUERY_MAX_CHARS = values.PositiveIntegerValue(
         1000, environ_name="AI_QUERY_MAX_CHARS", environ_prefix=None
     )
-    #string
-    AI_SEARCH_METHOD = values.Value(None, environ_name="AI_SEARCH_METHOD", environ_prefix=None)
-    #int
-    AI_SEARCH_LIMIT = values.PositiveIntegerValue(
-        10, environ_name="AI_SEARCH_LIMIT", environ_prefix=None
+    AI_SEARCH_METHOD = values.Value(
+        "hybrid", environ_name="AI_SEARCH_METHOD", environ_prefix=None
     )
-    #list
+    AI_RAG_CANDIDATE_LIMIT = values.PositiveIntegerValue(
+        25, environ_name="AI_RAG_CANDIDATE_LIMIT", environ_prefix=None
+    )
+    AI_RAG_CONTEXT_LIMIT = values.PositiveIntegerValue(
+        5, environ_name="AI_RAG_CONTEXT_LIMIT", environ_prefix=None
+    )
+    AI_RAG_MIN_RELEVANCE = values.FloatValue(
+        0.5, environ_name="AI_RAG_MIN_RELEVANCE", environ_prefix=None
+    )
+    AI_RAG_RERANK_MODEL = values.Value(
+        "openweight-rerank", environ_name="AI_RAG_RERANK_MODEL", environ_prefix=None
+    )
+    AI_RAG_COLLECTION_ROUTES = JSONValue(
+        [], environ_name="AI_RAG_COLLECTION_ROUTES", environ_prefix=None
+    )
     AI_COLLECTION_IDS = values.ListValue(
         default=[], environ_name="AI_COLLECTION_IDS", environ_prefix=None
     )

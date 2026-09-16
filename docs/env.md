@@ -529,6 +529,13 @@ without redeploying the frontend (the flag is pulled from
 | `AI_BASE_URL` | None | Default URL to access AI API endpoint (Albert API) | Optional |
 | `AI_API_KEY` | None| API Key used for AI features | Optional |
 | `AI_MODEL` | None | Default model used for AI features | Optional |
+| `AI_COLLECTION_IDS` | `[]` | Comma-separated, trusted Albert public collection IDs for reply grounding. | Required for AI drafts |
+| `AI_PRIVATE_COLLECTION_ID` | None | Optional private Albert collection containing approved local procedures and policies. | Optional |
+| `AI_RAG_CANDIDATE_LIMIT` | `25` | Number of Albert search excerpts sent to reranking. | Optional |
+| `AI_RAG_CONTEXT_LIMIT` | `5` | Maximum reranked excerpts supplied to the generation model. | Optional |
+| `AI_RAG_MIN_RELEVANCE` | `0.5` | Minimum reranker relevance score; tune using reviewed examples before production rollout. | Optional |
+| `AI_RAG_RERANK_MODEL` | `openweight-rerank` | Albert reranker model. | Optional |
+| `AI_RAG_COLLECTION_ROUTES` | `[]` | Optional JSON list of keyword routes, e.g. `[{'keywords':['congé','préavis'],'collection_ids':[150277]}]`, to narrow retrieval to an appropriate trusted collection. | Optional |
 | `FEATURE_AI_SUMMARY` | `False` | Default enabled mode for summary AI features | Required |
 | `FEATURE_AI_AUTOLABELS` | `False` | Default enabled mode for label AI features | Required |
 

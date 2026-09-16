@@ -2343,6 +2343,12 @@ class Message(BaseModel):
         blank=True,
         help_text="Sparse per-delivery pipeline record.",
     )
+    ai_metadata = models.JSONField(
+        "AI metadata",
+        null=True,
+        blank=True,
+        help_text="Grounding sources and review flags for an AI-generated draft.",
+    )
 
     objects = MessageManager()
 

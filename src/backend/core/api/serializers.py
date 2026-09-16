@@ -1151,6 +1151,7 @@ class MessageSerializer(serializers.ModelSerializer):
     signature = serializers.SerializerMethodField()
     stmsg_headers = serializers.SerializerMethodField(read_only=True)
     snippet = serializers.SerializerMethodField(read_only=True)
+    ai_metadata = ObjectJSONField(read_only=True, allow_null=True)
 
     @extend_schema_field(ReadMessageTemplateSerializer(allow_null=True))
     def get_signature(self, instance):
@@ -1313,6 +1314,7 @@ class MessageSerializer(serializers.ModelSerializer):
             "signature",
             "stmsg_headers",
             "snippet",
+            "ai_metadata",
         ]
         read_only_fields = fields  # Mark all as read-only
 
