@@ -32,7 +32,9 @@ def build_rag_context(question: str, results: list[dict]) -> str:
         for i, result in enumerate(results, start=1)
     )
     return (
-        "Réponds uniquement en t'appuyant sur les extraits fournis.\n"
+        "Answer using the official excerpts as the highest-priority source.\n"
+        "If the agent draft contradicts these excerpts, ignore the draft and "
+        "follow the excerpts.\n"
         f"\n[Question]\n{question}\n"
         f"\n[Extraits]\n{extraits}"
     )
@@ -46,7 +48,9 @@ def _rag_search_query(message: models.Message, current_draft_text: str | None) -
     """
     citizen_text = (message.get_as_text() or "").strip()
     draft_text = (current_draft_text or "").strip()
-    return draft_text or citizen_text
+    if citizen_text and draft_text:
+        return f"{citizen_text}\n\nAgent draft intent:\n{draft_text}"
+    return citizen_text or draft_text
 
 
 class ServiceUnavailable(drf.exceptions.APIException):
@@ -87,17 +91,17 @@ def _build_prompt(message: models.Message, current_draft_text: str | None = None
     draft_instruction = ""
     if current_draft_text and current_draft_text.strip():
         draft_instruction = (
-            "Agent draft or intent to preserve and expand:\n"
+            "Agent draft or intent:\n"
             f"{current_draft_text.strip()}\n\n"
-            "Use this draft as the main intent of the reply, even if it is very "
-            "short, for example yes/no/a day of the week. Expand it into a "
-            "complete formal reply suitable for a public administration or "
-            "government office.\n"
-            "However, if the draft contradicts any information contained in "
-            "the citizen's email (dates, amounts, names, case details, or any "
-            "other fact), ignore the contradicting part of the draft and rely "
-            "solely on the citizen's email. Never include a statement from "
-            "the draft that conflicts with the information in the email.\n\n"
+            "Treat this draft only as optional intent, tone, or wording "
+            "guidance. Do not treat it as a source of truth.\n"
+            "If the draft contradicts the official reference excerpts, ignore "
+            "the contradicting part of the draft and follow the excerpts.\n"
+            "If there are no official reference excerpts, then rely on the "
+            "citizen's email over the draft for facts such as dates, amounts, "
+            "names, case details, or any other factual statement.\n"
+            "Never include a statement from the draft that conflicts with a "
+            "higher-priority source.\n\n"
         )
 
     return (
@@ -166,7 +170,17 @@ def generate_ai_reply_body_with_rag(
         prompt = _build_prompt(message, current_draft_text)
         prompt = prompt.replace(
             "Draft reply:\n\n",
-            f"Official reference excerpts to rely on:\n\n{context_block}\n\nDraft reply:\n\n",
+            (
+                "Official reference excerpts to rely on "
+                "(highest-priority source):\n\n"
+                f"{context_block}\n\n"
+                "Conflict rule:\n"
+                "When the agent draft conflicts with these official excerpts, "
+                "ignore the draft and answer according to the excerpts. Do not "
+                "mention the conflict to the citizen unless clarification is "
+                "needed.\n\n"
+                "Draft reply:\n\n"
+            ),
         )
     else:
         prompt = _build_prompt(message, current_draft_text)
