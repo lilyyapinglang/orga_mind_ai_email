@@ -1357,6 +1357,15 @@ class Base(Configuration):
     )
     # Docs: source of the documents imported into the private AI collection
     # (``manage.py private_collection --from-docs``).
+    DOCS_USERNAME = values.Value(
+        None, environ_name="DOCS_USERNAME", environ_prefix=None
+    )
+    DOCS_PASSWORD = values.Value(
+        None, environ_name="DOCS_PASSWORD", environ_prefix=None
+    )
+    DOCS_SESSIONID = values.Value(
+        None, environ_name="DOCS_SESSIONID", environ_prefix=None
+    )
     DOCS_CONFIG = {
         # URL of the Docs backend as seen by a browser: login redirects use it.
         "base_url": values.Value(
@@ -1375,17 +1384,13 @@ class Base(Configuration):
         ),
         "timeout_seconds": 30,
     }
-    #int
     AI_QUERY_MAX_CHARS = values.PositiveIntegerValue(
         1000, environ_name="AI_QUERY_MAX_CHARS", environ_prefix=None
     )
-    #string
     AI_SEARCH_METHOD = values.Value(None, environ_name="AI_SEARCH_METHOD", environ_prefix=None)
-    #int
     AI_SEARCH_LIMIT = values.PositiveIntegerValue(
         10, environ_name="AI_SEARCH_LIMIT", environ_prefix=None
     )
-    #list
     AI_COLLECTION_IDS = values.ListValue(
         default=[], environ_name="AI_COLLECTION_IDS", environ_prefix=None
     )
