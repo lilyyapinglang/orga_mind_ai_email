@@ -156,12 +156,12 @@ class Command(BaseCommand):
 
     @staticmethod
     def _authenticated_docs_client(email: str | None) -> DocsClient:
-        session_id = os.environ.get("DOCS_SESSIONID", "").strip()
+        session_id = settings.DOCS_SESSIONID
         client = DocsClient(session_id=session_id or None)
         try:
             if not session_id:
-                email = "user1@example.local"
-                password = "user1"
+                email = settings.DOCS_USERNAME
+                password = settings.DOCS_PASSWORD
                 client.login(email, password)
             client.ensure_authenticated()
         except EOFError as exc:
