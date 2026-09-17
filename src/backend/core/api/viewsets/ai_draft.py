@@ -29,15 +29,62 @@ THREAD_CONTEXT_MAX_CHARS_PER_MESSAGE = 2000
 
 
 def build_rag_context(question: str, results: list[dict]) -> str:
-    """Build the RAG context block from the retrieved chunks."""
-    extraits = "\n\n".join(
-        f"[Extrait {i}]\n{result['chunk']['content']}"
-        for i, result in enumerate(results, start=1)
-    )
+    """Build a provenance-preserving RAG context block.
+
+    The source identifiers come directly from the Albert /search response.
+    No source metadata is inferred or reconstructed.
+    """
+    excerpts = []
+
+    for index, result in enumerate(results, start=1):
+        chunk = result.get("chunk") or {}
+        metadata = chunk.get("metadata") or {}
+
+        title = metadata.get("title") or "Source officielle"
+        url = metadata.get("url") or ""
+        chunk_id = metadata.get("_chunk_id") or chunk.get("id")
+        document_id = metadata.get("_doc_id") or chunk.get("document_id")
+        score = result.get("score")
+        content = chunk.get("content")
+
+        if not content:
+            continue
+
+        source_lines = [
+            f"[Source {index}]",
+            f"Titre: {title}",
+        ]
+
+        if url:
+            source_lines.append(f"URL: {url}")
+
+        if chunk_id is not None:
+            source_lines.append(f"Chunk: {chunk_id}")
+
+        if document_id is not None:
+            source_lines.append(f"Document: {document_id}")
+
+        if score is not None:
+            source_lines.append(f"Score de recherche: {score}")
+
+        source_lines.append(f"Contenu:\n{content}")
+
+        excerpts.append("\n".join(source_lines))
+
+    if not excerpts:
+        return (
+            "Aucune source officielle exploitable n'a été retrouvée.\n"
+            f"\n[Question]\n{question}"
+        )
+
     return (
-        "Réponds uniquement en t'appuyant sur les extraits fournis.\n"
-        f"\n[Question]\n{question}\n"
-        f"\n[Extraits]\n{extraits}"
+        "Les sources ci-dessous sont les seules sources officielles "
+        "fournies pour établir les faits administratifs de la réponse.\n"
+        "Les identifiants [Source X] servent uniquement à identifier les "
+        "sources et ne doivent pas apparaître dans la réponse destinée au citoyen.\n"
+        f"\n[Question]\n{question}"
+        f"\n\n[Sources officielles]\n\n"
+        + "\n\n".join(excerpts)
     )
 
 
@@ -76,17 +123,18 @@ def _build_thread_context(message: models.Message) -> str:
     return "\n\n".join(entries)
 
 
-def _rag_search_query(message: models.Message, current_draft_text: str | None) -> str:
-    """Build the search query: email thread first, agent draft as fallback.
+def _rag_search_query(
+    message: models.Message, current_draft_text: str | None
+) -> str:
+    """Build the Albert search query from the citizen's email thread only.
 
-    The email thread is the actual question; the agent draft is only an
-    intent and may be empty — it must never be sent as-is to /v1/search.
+    The current agent draft is intentionally excluded from retrieval because
+    it represents an agent hypothesis/intent, not authoritative evidence.
+    Including it in the search query could bias retrieval toward supporting
+    an already-written claim.
     """
-    citizen_text = (_build_thread_context(message) or "").strip()
-    draft_text = (current_draft_text or "").strip()
-    if citizen_text and draft_text:
-        return f"{citizen_text}\n\nAgent draft intent:\n{draft_text}"
-    return citizen_text or draft_text
+    del current_draft_text  # Retrieval must not depend on the agent draft.
+    return (_build_thread_context(message) or "").strip()
 
 
 class ServiceUnavailable(drf.exceptions.APIException):
@@ -122,27 +170,74 @@ def _blocknote_paragraphs(text: str) -> str:
     return json.dumps(paragraphs)
 
 
-def _build_prompt(message: models.Message, current_draft_text: str | None = None) -> str:
+def _build_prompt(
+    message: models.Message,
+    current_draft_text: str | None = None,
+    rag_context: str | None = None,
+) -> str:
     """Build the prompt used to generate a citizen-facing reply."""
+
     draft_instruction = ""
     if current_draft_text and current_draft_text.strip():
         draft_instruction = (
-            "Agent draft or intent to preserve and expand:\n"
+            "Agent draft or intent:\n"
             f"{current_draft_text.strip()}\n\n"
-            "Use this draft as the main intent of the reply, even if it is very "
-            "short, for example yes/no/a day of the week. Expand it into a "
-            "complete formal reply suitable for a public administration or "
-            "government office.\n"
-            "However, if the draft contradicts any information contained in "
-            "the citizen's email (dates, amounts, names, case details, or any "
-            "other fact), ignore the contradicting part of the draft and rely "
-            "solely on the citizen's email. Never include a statement from "
-            "the draft that conflicts with the information in the email.\n\n"
+            "Use this draft only to understand the agent's intended "
+            "direction, wording, or requested answer.\n"
+            "The agent draft is NOT an authoritative source of facts.\n"
+            "Do not use a factual claim from the agent draft unless that "
+            "claim is supported by the citizen's email or by an official "
+            "source provided below.\n"
+            "If the agent draft conflicts with the citizen's email or the "
+            "official sources, do not use the conflicting claim.\n\n"
+        )
+
+    if rag_context:
+        source_instruction = (
+            "Official reference material:\n"
+            f"{rag_context}\n\n"
+            "Rules for using the official reference material:\n"
+            "- Use official sources as the authority for administrative, "
+            "legal, procedural, eligibility, deadline, and timing facts.\n"
+            "- Every administrative factual claim in the reply must be "
+            "supported by the provided official sources.\n"
+            "- Do not infer a deadline, processing time, eligibility "
+            "condition, procedure, or obligation from incomplete information.\n"
+            "- Do not turn a maximum duration into a normal processing time.\n"
+            "- Do not turn an exception into a general rule.\n"
+            "- Do not turn an example into a general rule.\n"
+            "- Do not combine separate statements to manufacture a deadline "
+            "or other factual rule that the source does not explicitly establish.\n"
+            "- If the sources do not establish the answer, say so clearly "
+            "and ask for the missing information when appropriate.\n"
+            "- Do not use general knowledge or model knowledge to fill gaps "
+            "in the official sources.\n"
+            "- Do not mention the internal source labels or retrieval process "
+            "to the citizen.\n\n"
+        )
+    else:
+        source_instruction = (
+            "No official reference material is currently available.\n"
+            "Do not use model knowledge to invent or assert administrative, "
+            "legal, procedural, eligibility, deadline, or timing facts.\n"
+            "If the citizen's request requires such information, explain "
+            "that the available information is insufficient and ask for the "
+            "missing information or direct the citizen to the appropriate "
+            "official service when that can be stated without inventing "
+            "specific details.\n\n"
         )
 
     return (
         "You are helping a government agent draft a reply to a citizen.\n\n"
         "Write only the reply body. Do not include a subject line.\n\n"
+        "Authority hierarchy:\n"
+        "1. The citizen email/thread is authoritative for facts about the "
+        "citizen's own situation, dates, names, amounts, and case details.\n"
+        "2. The provided official sources are authoritative for "
+        "administrative, legal, procedural, eligibility, deadline, and "
+        "timing information.\n"
+        "3. The agent draft is only an expression of intent. It is not "
+        "evidence and must never be treated as authoritative by itself.\n\n"
         "Requirements:\n"
         "- Be concise. Keep the reply short, ideally under 150 words.\n"
         "- Use a formal and professional tone, as expected from a public "
@@ -153,17 +248,18 @@ def _build_prompt(message: models.Message, current_draft_text: str | None = None
         "d'agréer, Madame, Monsieur, l'expression de mes salutations "
         "distinguées.') followed by the signature placeholder of the "
         "administration.\n"
-        "- You only can reply in the language of the citizen's email.\n"
-        "- Make sure your response is in the same language as the citizen's email.\n"
-        "- Do not use any Markdown formatting: no headings, no bold, no "
-        "italic, no bullet lists, no asterisks. Plain text only.\n"
-        "- Do not invent facts, promises, dates, or case details that are "
-        "not in the email thread. If information is missing, ask for it briefly.\n"
-        "- Consider the full email thread below in chronological order. Reply "
-        "to the latest/source citizen message, while preserving relevant "
-        "facts, commitments, answers, and unresolved requests from earlier "
-        "messages in the same thread.\n\n"
+        "- Reply in the same language as the citizen's email.\n"
+        "- Do not use Markdown formatting.\n"
+        "- Do not invent facts, promises, dates, amounts, deadlines, "
+        "processing times, procedures, or case details.\n"
+        "- If required information is missing, say what cannot be determined "
+        "and ask for it briefly.\n"
+        "- Consider the full email thread in chronological order.\n"
+        "- Reply to the latest/source citizen message while preserving "
+        "relevant facts, commitments, answers, and unresolved requests from "
+        "earlier messages in the same thread.\n\n"
         f"Email thread:\n{_build_thread_context(message)}\n\n"
+        f"{source_instruction}"
         f"{draft_instruction}"
         "Draft reply:\n\n"
     )
@@ -184,43 +280,44 @@ def generate_ai_reply_body(
         logger.exception("AI service failed without RAG context, re-raising")
         raise
 
-
 def generate_ai_reply_body_with_rag(
-        message: models.Message, current_draft_text: str | None = None
+    message: models.Message, current_draft_text: str | None = None
 ) -> str:
-    """Generate the reply body enriched with RAG chunks from Albert API."""
+    """Generate a reply using official evidence retrieved from Albert.
+
+    If official evidence is unavailable, generation remains possible but the
+    prompt explicitly prevents the model from filling administrative gaps
+    from its own knowledge.
+    """
     query = _rag_search_query(message, current_draft_text)
-    context_block = None
+    results: list[dict] = []
 
     if query:
         try:
             results = AIService().search_chunks(query)
-            logger.info("Albert RAG: %d chunks retrieved for query: %s", len(results), query[:200])
-            if results:
-                context_block = build_rag_context(query, results)
+            logger.info(
+                "Albert RAG: %d chunks retrieved for query: %s",
+                len(results),
+                query[:200],
+            )
         except ImproperlyConfigured:
-            # Pas de clé Albert configurée : réponse IA sans contexte RAG.
-            logger.warning("Albert API key not configured; skipping RAG context.")
+            logger.warning(
+                "Albert API key not configured; generating without official "
+                "reference context."
+            )
         except requests.RequestException:
-            # Albert indisponible ou requête rejetée : dégradation propre.
-            logger.exception("Albert RAG search failed; falling back without context.")
+            logger.exception(
+                "Albert RAG search failed; generating without official "
+                "reference context."
+            )
 
-    if context_block:
-        # Le bloc RAG est passé comme "draft/intent" complémentaire du prompt :
-        # le service IA conserve les consignes de ton et de non-invention.
-        prompt = _build_prompt(message, current_draft_text)
-        prompt = prompt.replace(
-            "Draft reply:\n\n",
-            f"Official reference excerpts to rely on:\n\n{context_block}\n\nDraft reply:\n\n"
-            "Conflict rule:\n"
-            "When the agent draft conflicts with these official excerpts, "
-            "ignore the draft and answer according to the excerpts. Do not "
-            "mention the conflict to the citizen unless clarification is "
-            "needed.\n\n"
-            "Draft reply:\n\n",
-        )
-    else:
-        prompt = _build_prompt(message, current_draft_text)
+    context_block = build_rag_context(query, results) if results else None
+
+    prompt = _build_prompt(
+        message,
+        current_draft_text=current_draft_text,
+        rag_context=context_block,
+    )
 
     return AIService().call_ai_api(prompt)
 

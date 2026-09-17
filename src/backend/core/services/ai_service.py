@@ -103,8 +103,22 @@ class AIService:
             timeout=60,
         )
         self.__check_response(response)
+
+        response_payload = response.json()
+
+        if not isinstance(response_payload, dict):
+            raise ValueError("Albert search response must be a JSON object.")
+
+        results = response_payload.get("data")
+
+        if not isinstance(results, list):
+            raise ValueError(
+            "Albert search response does not contain a valid data list."
+        )
+
+        return results
         # Réponse : {"object": "list", "data": [{"method", "score", "chunk": {...}}, ...]}
-        return response.json()["data"]
+       # return response.json()["data"]
 
     def call_ai_api(self, prompt):
         """Helper method to call the OpenAI API and process the response."""
